@@ -1,0 +1,15 @@
+[Unit]
+Description=Meteo Analyst API REST
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meteo-analyst
+EnvironmentFile=/opt/meteo-analyst/.env
+ExecStart=/opt/meteo-analyst/venv/bin/python3 /opt/meteo-analyst/meteo_api.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
