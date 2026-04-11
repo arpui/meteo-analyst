@@ -3,7 +3,10 @@
 Analitzador meteorològic amb ChatGPT Vision
 Processa imatges de l'estació cada N captures i desa resultats a SQLite
 """
+from dotenv import load_dotenv
+load_dotenv("/opt/meteo-analyst/.env")
 
+import argparse
 import os
 import sys
 import json
@@ -12,15 +15,19 @@ import sqlite3
 import logging
 from datetime import datetime
 from pathlib import Path
+import requests
+
 from openai import OpenAI
 
 # ─── Configuració ────────────────────────────────────────────────────────────
 
+HA_WEBHOOK_URL = "http://192.168.31.228:8123/api/webhook/meteo_update"
+HA_URL   = "http://192.168.31.228:8123"
 BASE_DIR       = Path("/data/meteo")
 DB_PATH        = Path("/opt/meteo-analyst/meteo.db")
 STATE_FILE     = Path("/opt/meteo-analyst/state.json")
-ANALYSE_EVERY  = 6
-
+ANALYSE_EVERY  = 1
+HA_TOKEN = os.environ.get("HA_TOKEN", "")
 # Model més econòmic que gpt-4.1 per aquesta tasca
 MODEL          = "gpt-4.1-mini"
 
@@ -288,15 +295,51 @@ def analitza_imatge(path_imatge: Path) -> dict:
     dades = json.loads(text)
     return normalitza_dades(dades)
 
+# ─── Notificació a Home Assistant ─────────────────────────────────────────────
+ 
+def notifica_ha():
+    try:
+        import requests
+        r = requests.post(HA_WEBHOOK_URL, timeout=5)
+        log.info(f"Webhook HA enviat: {r.status_code}")
+    except Exception as e:
+        log.warning(f"Webhook HA fallat (no crític): {e}")
+
+
+# ─── es de dia ────────────────────────────────────────────────────────────────────
+
+def es_de_dia():
+    try:
+        r = requests.get(
+            f"{HA_URL}/api/states/sun.sun",
+            headers={"Authorization": f"Bearer {HA_TOKEN}"},
+            timeout=5
+        )
+        elevacio = r.json()["attributes"].get("elevation", 0)
+        log.info(f"Elevació solar: {elevacio}°")
+        return elevacio > -5
+    except Exception as e:
+        log.warning(f"No s'ha pogut consultar el sol: {e} — assumint de dia")
+        return True
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", 
+                        help="Analitza ara independentment del comptador")
+    args = parser.parse_args()
+    
     init_db()
     estat = llegeix_estat()
 
     latest = BASE_DIR / "latest.jpg"
     if not latest.exists():
         log.warning("No s'ha trobat /data/meteo/latest.jpg — esperant captures")
+        sys.exit(0)
+
+    if not args.force and not es_de_dia():
+        log.info("És de nit (elevació solar ≤ 5°) — saltant anàlisi")
         sys.exit(0)
 
     estat["comptador"] += 1
@@ -310,6 +353,7 @@ def main():
     estat["comptador"] = 0
     estat["última_anàlisi"] = datetime.now().isoformat()
     desa_estat(estat)
+    notifica_ha() # per avisar dels canvis si es forçat
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log.info(f"Analitzant {latest} ...")

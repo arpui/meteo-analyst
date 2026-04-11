@@ -3,12 +3,12 @@
 API REST per exposar dades meteorològiques a Home Assistant
 Córrer com a servei systemd al LXC
 """
-
+import os
 import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
 
 app = Flask(__name__)
 
@@ -87,6 +87,45 @@ def historial():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+@app.route("/meteo/image")
+def image():
+    latest = BASE_DIR / "latest.jpg"
+    if not latest.exists():
+        return "no image", 404
+    return send_file(latest, mimetype="image/jpeg")
+
+import subprocess
+
+@app.route("/meteo/analitza", methods=["POST"])
+def analitza_ara():
+    """HA demana una anàlisi immediata del latest.jpg"""
+    try:
+        result = subprocess.run(
+            ["/opt/meteo-analyst/venv/bin/python3",
+             "/opt/meteo-analyst/meteo_analyst.py","--force"],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ}  # ← passa totes les variables d'entorn
+        )
+        if result.returncode == 0:
+            # Retorna directament l'última anàlisi (acabada de fer)
+            conn = get_db()
+            row = conn.execute(
+                "SELECT * FROM analisis ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            return jsonify({
+                "timestamp":        row["timestamp"],
+                "condició_general": row["condició_general"],
+                "cobertura_núvols": row["cobertura_núvols"],
+                "precipitació":     bool(row["precipitació"]),
+                "visibilitat":      row["visibilitat"],
+                "observacions":     row["observacions"],
+            })
+        else:
+            return jsonify({"error": result.stderr}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "timeout"}), 504
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8765, debug=False)
