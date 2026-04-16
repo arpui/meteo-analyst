@@ -24,7 +24,8 @@ from openai import OpenAI
 HA_WEBHOOK_URL = "http://192.168.31.228:8123/api/webhook/meteo_update"
 HA_URL   = "http://192.168.31.228:8123"
 BASE_DIR       = Path("/data/meteo")
-DB_PATH        = Path("/opt/meteo-analyst/meteo.db")
+DB_PATH  = Path("/data/meteo/meteo.db")
+#DB_PATH        = Path("/opt/meteo-analyst/meteo.db")
 STATE_FILE     = Path("/opt/meteo-analyst/state.json")
 ANALYSE_EVERY  = 1
 HA_TOKEN = os.environ.get("HA_TOKEN", "")

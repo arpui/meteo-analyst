@@ -3,6 +3,9 @@
 Col·lector de sensors meteorològics Ecowitt via Home Assistant REST API
 Cron cada 5min al LXC meteo → desa a /data/meteo/meteo.db (mountbind persistent)
 """
+from dotenv import load_dotenv
+load_dotenv("/opt/meteo-analyst/.env")
+
 import os
 import sqlite3
 import logging
