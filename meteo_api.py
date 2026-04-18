@@ -16,6 +16,9 @@ load_dotenv("/opt/meteo-analyst/.env")
 
 app = Flask(__name__)
 
+# Proveïdor de producció — determina quin LLM usa HA
+PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
+
 # BD unificada al directori mountbind (persistent a Debian)
 DB_PATH  = Path("/data/meteo/meteo.db")
 BASE_DIR = Path("/data/meteo")
@@ -32,8 +35,8 @@ def latest():
     """Última anàlisi visual — el que llegirà Home Assistant"""
     conn = get_db()
     row = conn.execute("""
-        SELECT * FROM analisis ORDER BY id DESC LIMIT 1
-    """).fetchone()
+        SELECT * FROM analisis WHERE provider = ? ORDER BY id DESC LIMIT 1
+    """, (PROVIDER_PROD,)).fetchone()
     conn.close()
 
     if not row:
@@ -58,9 +61,9 @@ def avui():
     avui_str = datetime.now().strftime("%Y-%m-%d")
     rows = conn.execute("""
         SELECT * FROM analisis
-        WHERE timestamp LIKE ?
+        WHERE timestamp LIKE ? AND provider = ?
         ORDER BY id DESC
-    """, (f"{avui_str}%",)).fetchall()
+    """, (f"{avui_str}%", PROVIDER_PROD)).fetchall()
     conn.close()
 
     if not rows:
@@ -111,7 +114,8 @@ def analitza_ara():
         if result.returncode == 0:
             conn = get_db()
             row = conn.execute(
-                "SELECT * FROM analisis ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM analisis WHERE provider = ? ORDER BY id DESC LIMIT 1",
+                (PROVIDER_PROD,)
             ).fetchone()
             conn.close()
             return jsonify({
@@ -286,11 +290,7 @@ def serve_foto(date_dir, nom_fitxer):
 def validacio():
     """
     Pàgina HTML per validar classificacions: foto + dades costat a costat
-    Paràmetres URL:
-      ?data=20260414     -> dia concret (YYYYMMDD)
-      ?limit=50          -> nombre de resultats (per defecte 20)
-      ?nocturnes=1       -> inclou fotos nocturnes
-      ?tot=1             -> sense cap filtre (nocturnes + dolentes)
+    ?data=20260414  ?limit=50  ?nocturnes=1  ?tot=1
     """
     from flask import request
 
@@ -298,6 +298,7 @@ def validacio():
     limit     = int(request.args.get("limit", 20))
     nocturnes = request.args.get("nocturnes", "0") == "1"
     tot       = request.args.get("tot", "0") == "1"
+    ordre     = request.args.get("ordre", "temps")  # temps | comparar
 
     filtres = []
     params  = []
@@ -311,161 +312,222 @@ def validacio():
             filtres.append("imatge_nocturna = 0")
         filtres.append("qualitat_imatge != 'dolenta'")
 
-    where = f"WHERE {' AND '.join(filtres)}" if filtres else ""
+    where    = f"WHERE {' AND '.join(filtres)}" if filtres else ""
+    order_sq = "ORDER BY timestamp ASC, provider ASC" if ordre == "comparar" else "ORDER BY timestamp ASC"
+
     params.append(limit)
 
     conn = get_db()
-    rows = conn.execute(f"""
+
+    # Pas 1: sky_classifications filtrades
+    sky_rows = conn.execute(f"""
         SELECT * FROM sky_classifications
         {where}
-        ORDER BY id DESC LIMIT ?
+        {order_sq} LIMIT ?
     """, params).fetchall()
+
+    # Pas 2: per cada fila, busca el sensor més proper
+    rows = []
+    for r in sky_rows:
+        m = conn.execute("""
+            SELECT temp_outdoor, humidity, pressure_rel, wind_speed, rain_rate
+            FROM meteo_readings
+            WHERE timestamp BETWEEN
+                datetime(?, '-10 minutes') AND
+                datetime(?, '+10 minutes')
+            ORDER BY ABS(strftime('%s', timestamp) - strftime('%s', ?))
+            LIMIT 1
+        """, (r["timestamp"], r["timestamp"], r["timestamp"])).fetchone()
+        rows.append((r, m))
+
     conn.close()
 
     if not rows:
         return "<h2>Sense classificacions encara</h2>", 404
 
-    # Construeix targetes HTML
-    cards = ""
-    for r in rows:
-        fitxer   = Path(r["fitxer"])
-        date_dir = fitxer.parent.name
-        nom      = fitxer.name
-        foto_url = f"/meteo/foto/{date_dir}/{nom}"
-
+    def build_dades(r, m):
+        """Genera el bloc de dades (taula) per una classificació."""
         raw = json.loads(r["raw_json"]) if r["raw_json"] else {}
-        obs = raw.get("observacions", "—")
-
-        # Color badge per cobertura
+        obs = raw.get("observacions", "")
         cob = r["cobertura_pct"] or 0
-        if cob < 25:
-            badge_color = "#27ae60"
-        elif cob < 60:
-            badge_color = "#f39c12"
+        if cob < 25:   badge_cob = "#27ae60"
+        elif cob < 60: badge_cob = "#f39c12"
+        else:          badge_cob = "#7f8c8d"
+        conf = r["confianca_total"]
+        if conf is None:   conf_color = "#555"
+        elif conf >= 80:   conf_color = "#27ae60"
+        elif conf >= 60:   conf_color = "#f39c12"
+        else:              conf_color = "#e74c3c"
+        conf_text = f"{conf}%" if conf is not None else "—"
+        temp  = f"{m['temp_outdoor']:.1f}°C" if m and m["temp_outdoor"] is not None else "—"
+        hum   = f"{m['humidity']:.0f}%" if m and m["humidity"] is not None else "—"
+        pres  = f"{m['pressure_rel']:.0f} hPa" if m and m["pressure_rel"] is not None else "—"
+        vent  = f"{m['wind_speed']:.1f} km/h" if m and m["wind_speed"] is not None else "—"
+        pluja = f"{m['rain_rate']:.1f} mm/h" if m and m["rain_rate"] is not None else "—"
+        dp = r["delta_pressio_1h"]
+        if dp is not None:
+            signe = "+" if dp >= 0 else ""
+            dp_color = "#27ae60" if dp > 0.5 else ("#e74c3c" if dp < -0.5 else "#aaa")
+            dp_text = f'<span style="color:{dp_color}">{signe}{dp:.1f} hPa/h</span>'
         else:
-            badge_color = "#7f8c8d"
+            dp_text = "—"
+        prov  = r["provider"] or "claude"
+        mod   = (r["model"] or "").split("/")[-1].replace("claude-","").replace("-20251001","").replace("-2024","")
+        provider_badge = f"{prov}/{mod}"
+        return f"""
+            <div class="fila cap">
+                <span class="badge" style="background:{badge_cob}">☁ {cob}% cobert</span>
+                <span class="badge" style="background:#2980b9">☀ {r["cel_visible_pct"] or 0}% lliure</span>
+                <span class="badge" style="background:{conf_color}">⚡ {conf_text}</span>
+                <span class="badge" style="background:#555;font-size:0.7em">{provider_badge}</span>
+            </div>
+            <table>
+                <tr><td>Núvol</td><td><b>{r["genere_nubol"] or "—"}</b> / {r["altura_nubol"] or "—"} / {r["textura_nubol"] or "—"}</td></tr>
+                <tr><td>Color / Llum</td><td>{r["color_cel"] or "—"} / {r["intensitat_llum"] or "—"}</td></tr>
+                <tr><td>Boira / Contrail</td><td>{("✓ boira" if r["presencia_boira"] else "—")} / {("✓ contrail" if r["presencia_contrail"] else "—")}</td></tr>
+                <tr><td>Precipitació / Neu</td><td>{("🌧 sí" if r["precipitacio_visual"] else "—")} / {("❄ sí" if r["neu_visual"] else "—")}</td></tr>
+                <tr><td>Objectiu</td><td>{r["objectiu_net"] or "—"} {("💧" if r["gotes_objectiu"] else "")}</td></tr>
+                <tr><td>Qualitat</td><td>{r["qualitat_imatge"] or "—"}</td></tr>
+                <tr style="background:#0a1628"><td colspan="2" style="color:#7fb3d3;padding-top:5px">⬡ Sensors</td></tr>
+                <tr><td>Temp / Hum / Pressió</td><td>{temp} / {hum} / {pres}</td></tr>
+                <tr><td>Vent / Pluja sensor</td><td>{vent} / {pluja}</td></tr>
+                <tr><td>Δ Pressió 1h</td><td>{dp_text}</td></tr>
+                <tr><td>Confiança LLM / Coh.</td><td>{r["confianca_llm"] or "—"} / {r["confianca_coherencia"] or "—"}</td></tr>
+                {'<tr><td>Observacions</td><td><i>' + obs + '</i></td></tr>' if obs else ""}
+            </table>"""
 
-        cards += f"""
-        <div class="card">
-            <div class="foto">
-                <img src="{foto_url}" alt="{nom}" loading="lazy">
-                <div class="timestamp">{r["timestamp"]}</div>
-            </div>
-            <div class="dades">
-                <div class="fila cap">
-                    <span class="badge" style="background:{badge_color}">
-                        ☁ {cob}% cobert
-                    </span>
-                    <span class="badge" style="background:#2980b9">
-                        ☀ {r["cel_visible_pct"] or 0}% cel lliure
-                    </span>
+    if ordre == "comparar":
+        from collections import defaultdict
+        grups = defaultdict(list)
+        for r, m in rows:
+            grups[r["fitxer"]].append((r, m))
+
+        cards = ""
+        for fitxer_key, classificacions in grups.items():
+            fitxer   = Path(fitxer_key)
+            date_dir = fitxer.parent.name
+            nom      = fitxer.name
+            foto_url = f"/meteo/foto/{date_dir}/{nom}"
+            ts       = classificacions[0][0]["timestamp"]
+
+            # Sensors (agafem el primer que tingui dades)
+            m_sens = next((m for _, m in classificacions if m), None)
+            temp  = f"{m_sens['temp_outdoor']:.1f}°C" if m_sens and m_sens["temp_outdoor"] is not None else "—"
+            hum   = f"{m_sens['humidity']:.0f}%" if m_sens and m_sens["humidity"] is not None else "—"
+            pres  = f"{m_sens['pressure_rel']:.0f} hPa" if m_sens and m_sens["pressure_rel"] is not None else "—"
+            vent  = f"{m_sens['wind_speed']:.1f} km/h" if m_sens and m_sens["wind_speed"] is not None else "—"
+            pluja = f"{m_sens['rain_rate']:.1f} mm/h" if m_sens and m_sens["rain_rate"] is not None else "—"
+
+            # Columnes per model — header + dades compactes
+            cols_header = ""
+            cols_dades  = ""
+            for r, m in classificacions:
+                prov  = r["provider"] or "claude"
+                mod   = (r["model"] or "").split("/")[-1].replace("claude-","").replace("-20251001","").replace("-2024","")
+                label = f"{prov}/{mod}"
+                cob   = r["cobertura_pct"] or 0
+                if cob < 25:   bc = "#27ae60"
+                elif cob < 60: bc = "#f39c12"
+                else:           bc = "#7f8c8d"
+                conf  = r["confianca_total"]
+                cc    = "#27ae60" if conf and conf>=80 else ("#f39c12" if conf and conf>=60 else "#e74c3c") if conf else "#555"
+                ct    = f"{conf}%" if conf else "—"
+                dp    = r["delta_pressio_1h"]
+                dp_t  = f"{'+ ' if dp and dp>=0 else ''}{dp:.1f}" if dp is not None else "—"
+
+                cols_header += f'<th><span class="badge" style="background:#334">{label}</span></th>'
+                cols_dades  += f"""<td>
+                    <div style="margin-bottom:4px">
+                        <span class="badge" style="background:{bc};font-size:0.7em">☁{cob}%</span>
+                        <span class="badge" style="background:{cc};font-size:0.7em">⚡{ct}</span>
+                    </div>
+                    <div style="font-size:0.75em;line-height:1.6">
+                        <b>{r["genere_nubol"] or "—"}</b><br>
+                        {r["color_cel"] or "—"} / {r["intensitat_llum"] or "—"}<br>
+                        {("🌧" if r["precipitacio_visual"] else "")}
+                        {("❄" if r["neu_visual"] else "")}
+                        {("🌫" if r["presencia_boira"] else "")}
+                        {("💧" if r["gotes_objectiu"] else "")}
+                        {("✈" if r["presencia_contrail"] else "")}<br>
+                        obj: {r["objectiu_net"] or "—"}<br>
+                        Δp: {dp_t} hPa/h<br>
+                        LLM:{r["confianca_llm"] or "—"} Coh:{r["confianca_coherencia"] or "—"}
+                    </div>
+                </td>"""
+
+            cards += f"""
+            <div class="card card-comparar">
+                <div class="foto">
+                    <img src="{foto_url}" alt="{nom}" loading="lazy">
+                    <div class="timestamp">{ts}</div>
                 </div>
-                <table>
-                    <tr><td>Gènere núvol</td><td><b>{r["genere_nubol"] or "—"}</b></td></tr>
-                    <tr><td>Altura</td><td>{r["altura_nubol"] or "—"}</td></tr>
-                    <tr><td>Textura</td><td>{r["textura_nubol"] or "—"}</td></tr>
-                    <tr><td>Color cel</td><td>{r["color_cel"] or "—"}</td></tr>
-                    <tr><td>Intensitat llum</td><td>{r["intensitat_llum"] or "—"}</td></tr>
-                    <tr><td>Boira</td><td>{"✓" if r["presencia_boira"] else "—"}</td></tr>
-                    <tr><td>Contrail</td><td>{"✓" if r["presencia_contrail"] else "—"}</td></tr>
-                    <tr><td>Qualitat</td><td>{r["qualitat_imatge"] or "—"}</td></tr>
-                    <tr><td>Observacions</td><td><i>{obs}</i></td></tr>
-                </table>
-            </div>
-        </div>"""
+                <div class="dades-multi">
+                    <table class="taula-comp">
+                        <thead><tr><th></th>{cols_header}</tr></thead>
+                        <tbody><tr><td class="label-col">Classificació</td>{cols_dades}</tr></tbody>
+                    </table>
+                    <div class="sensors-row">
+                        🌡 {temp} &nbsp;|&nbsp; 💧 {hum} &nbsp;|&nbsp;
+                        🔵 {pres} &nbsp;|&nbsp; 💨 {vent} &nbsp;|&nbsp; 🌧 {pluja}
+                    </div>
+                </div>
+            </div>"""
+    else:
+        cards = ""
+        for r, m in rows:
+            fitxer   = Path(r["fitxer"])
+            date_dir = fitxer.parent.name
+            nom      = fitxer.name
+            foto_url = f"/meteo/foto/{date_dir}/{nom}"
+            cards += f"""
+            <div class="card">
+                <div class="foto">
+                    <img src="{foto_url}" alt="{nom}" loading="lazy">
+                    <div class="timestamp">{r["timestamp"]}</div>
+                </div>
+                <div class="dades">{build_dades(r, m)}</div>
+            </div>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="ca">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Validació classificacions cel</title>
+    <title>Validacio classificacions cel</title>
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            background: #1a1a2e;
-            color: #eee;
-            padding: 20px;
-        }}
-        h1 {{
-            text-align: center;
-            margin-bottom: 24px;
-            font-size: 1.4em;
-            color: #a8d8ea;
-        }}
-        .grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(560px, 1fr));
-            gap: 20px;
-        }}
-        .card {{
-            background: #16213e;
-            border-radius: 12px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: row;
-            border: 1px solid #0f3460;
-        }}
-        .foto {{
-            position: relative;
-            width: 240px;
-            min-width: 240px;
-        }}
-        .foto img {{
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            display: block;
-        }}
-        .timestamp {{
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0,0,0,0.7);
-            font-size: 0.7em;
-            padding: 4px 6px;
-            text-align: center;
-            color: #ccc;
-        }}
-        .dades {{
-            padding: 12px;
-            flex: 1;
-        }}
-        .fila.cap {{
-            display: flex;
-            gap: 8px;
-            margin-bottom: 10px;
-            flex-wrap: wrap;
-        }}
-        .badge {{
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 0.8em;
-            font-weight: bold;
-            color: white;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.82em;
-        }}
-        td {{
-            padding: 3px 6px;
-            border-bottom: 1px solid #0f3460;
-        }}
-        td:first-child {{
-            color: #a8d8ea;
-            width: 45%;
-        }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #1a1a2e; color: #eee; padding: 20px; }}
+        h1 {{ text-align: center; margin-bottom: 24px; font-size: 1.4em; color: #a8d8ea; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 20px; }}
+        .card {{ background: #16213e; border-radius: 12px; overflow: hidden;
+                 display: flex; flex-direction: row; border: 1px solid #0f3460; }}
+        .foto {{ position: relative; width: 240px; min-width: 240px; }}
+        .foto img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+        .timestamp {{ position: absolute; bottom: 0; left: 0; right: 0;
+                      background: rgba(0,0,0,0.75); font-size: 0.68em;
+                      padding: 3px 6px; text-align: center; color: #ccc; }}
+        .dades {{ padding: 10px; flex: 1; }}
+        .fila.cap {{ display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }}
+        .badge {{ padding: 3px 8px; border-radius: 20px; font-size: 0.75em;
+                  font-weight: bold; color: white; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.78em; }}
+        td {{ padding: 2px 5px; border-bottom: 1px solid #0f3460; }}
+        td:first-child {{ color: #a8d8ea; width: 42%; }}
+        /* Mode comparar */
+        .card-comparar {{ align-items: stretch; flex-direction: row; }}
+        .dades-multi {{ flex: 1; display: flex; flex-direction: column; }}
+        .taula-comp {{ width: 100%; border-collapse: collapse; flex: 1; }}
+        .taula-comp th {{ background: #0f3460; padding: 5px 8px; font-size: 0.75em; text-align: center; }}
+        .taula-comp td {{ padding: 6px 8px; border: 1px solid #0f3460; vertical-align: top; }}
+        .taula-comp .label-col {{ color: #a8d8ea; font-size: 0.75em; width: 60px; }}
+        .sensors-row {{ padding: 6px 10px; background: #0a1628; font-size: 0.75em;
+                        color: #a8d8ea; border-top: 1px solid #0f3460; }}
     </style>
 </head>
 <body>
-    <h1>🌤 Validació classificacions del cel — últimes {len(rows)}</h1>
-    <div class="grid">
-        {cards}
-    </div>
+    <h1>🌤 Validacio classificacions — {len(rows)} resultats · mode: {ordre}</h1>
+    <div class="grid">{cards}</div>
 </body>
 </html>"""
 

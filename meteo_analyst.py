@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
 """
-Analitzador meteorològic amb ChatGPT Vision
+Analitzador meteorològic amb Vision LLM
 Processa imatges de l'estació cada N captures i desa resultats a SQLite
+Suporta múltiples proveïdors: claude, openai, local
 """
-from dotenv import load_dotenv
-load_dotenv("/opt/meteo-analyst/.env")
-
 import argparse
 import os
 import sys
 import json
-import base64
 import sqlite3
 import logging
 from datetime import datetime
 from pathlib import Path
 import requests
+from dotenv import load_dotenv
 
-from openai import OpenAI
+load_dotenv("/opt/meteo-analyst/.env")
+sys.path.insert(0, "/opt/meteo-analyst")
+from meteo_providers import get_provider, llm_vision
+
+# Proveïdor de producció per defecte
+PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
 
 # ─── Configuració ────────────────────────────────────────────────────────────
 
 HA_WEBHOOK_URL = "http://192.168.31.228:8123/api/webhook/meteo_update"
-HA_URL   = "http://192.168.31.228:8123"
+HA_URL         = "http://192.168.31.228:8123"
 BASE_DIR       = Path("/data/meteo")
-DB_PATH  = Path("/data/meteo/meteo.db")
-#DB_PATH        = Path("/opt/meteo-analyst/meteo.db")
+DB_PATH        = Path("/data/meteo/meteo.db")
 STATE_FILE     = Path("/opt/meteo-analyst/state.json")
 ANALYSE_EVERY  = 1
-HA_TOKEN = os.environ.get("HA_TOKEN", "")
-# Model més econòmic que gpt-4.1 per aquesta tasca
-MODEL          = "gpt-4.1-mini"
+HA_TOKEN       = os.environ.get("HA_TOKEN", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,26 +41,6 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
-
-# ─── Constants de validació ──────────────────────────────────────────────────
-
-TIPUS_NUVOLS = {
-    "sense núvols", "cúmuls", "estrats", "cirrus",
-    "nimboestrats", "cumulonimbus", "no visible"
-}
-
-TIPUS_PRECIP = {
-    "pluja", "pluja feble", "aiguaneu", "neu", "cap", "no determinat"
-}
-
-VISIBILITAT = {"alta", "mitja", "baixa", "molt baixa"}
-
-VENT = {"calma", "lleuger", "moderat", "fort"}
-
-CONDICIO_GENERAL = {
-    "assolellat", "parcialment ennuvolat", "ennuvolat",
-    "boirós", "plujós", "tempestuós", "nocturn"
-}
 
 # ─── Base de dades ───────────────────────────────────────────────────────────
 
@@ -79,13 +59,20 @@ def init_db():
             vent_apparent    TEXT,
             condició_general TEXT,
             observacions     TEXT,
+            provider         TEXT DEFAULT 'claude',
             raw_json         TEXT
         )
     """)
+    # Afegeix columna provider si no existeix (migració BD existent)
+    try:
+        conn.execute("ALTER TABLE analisis ADD COLUMN provider TEXT DEFAULT 'claude'")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
-def desa_analisi(timestamp, imatge, dades):
+def desa_analisi(timestamp, imatge, dades, provider):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT INTO analisis (
@@ -93,19 +80,20 @@ def desa_analisi(timestamp, imatge, dades):
             cobertura_núvols, tipus_núvols,
             precipitació, tipus_precipit,
             visibilitat, vent_apparent,
-            condició_general, observacions, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            condició_general, observacions,
+            provider, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        timestamp,
-        str(imatge),
+        timestamp, str(imatge),
         dades.get("cobertura_núvols"),
         dades.get("tipus_núvols"),
-        int(bool(dades.get("precipitació", False))),
+        int(dades.get("precipitació", False)),
         dades.get("tipus_precipitació"),
         dades.get("visibilitat"),
         dades.get("vent_apparent"),
         dades.get("condició_general"),
         dades.get("observacions"),
+        provider,
         json.dumps(dades, ensure_ascii=False)
     ))
     conn.commit()
@@ -121,193 +109,31 @@ def llegeix_estat():
 def desa_estat(estat):
     STATE_FILE.write_text(json.dumps(estat, ensure_ascii=False, indent=2))
 
-# ─── Prompt + schema ─────────────────────────────────────────────────────────
+# ─── Prompt ───────────────────────────────────────────────────────────────────
 
-PROMPT = """Analitza aquesta imatge d'una estació meteorològica.
+PROMPT = """Analitza aquesta imatge d'una estació meteorològica i retorna ÚNICAMENT un objecte JSON vàlid, sense cap text addicional, amb aquests camps:
 
-Retorna exclusivament un objecte JSON vàlid.
-No afegeixis text fora del JSON.
-No facis markdown.
-No incloguis explicacions.
-
-Criteris:
-- "cobertura_núvols": enter de 0 a 100
-- "tipus_núvols": classifica només amb una de les opcions permeses
-- "precipitació": true o false
-- "tipus_precipitació": usa només una de les opcions permeses
-- "visibilitat": usa només una de les opcions permeses
-- "vent_apparent": inferit visualment de vegetació o objectes
-- "condició_general": usa només una de les opcions permeses
-- "observacions": text curt, màxim 100 caràcters
-
-Si la imatge és nocturna o molt fosca:
-- marca "condició_general" com "nocturn"
-- completa la resta de camps amb la millor inferència possible"""
-
-ANALYSIS_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "cobertura_núvols": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 100
-        },
-        "tipus_núvols": {
-            "type": "string",
-            "enum": [
-                "sense núvols", "cúmuls", "estrats", "cirrus",
-                "nimboestrats", "cumulonimbus", "no visible"
-            ]
-        },
-        "precipitació": {
-            "type": "boolean"
-        },
-        "tipus_precipitació": {
-            "type": "string",
-            "enum": ["pluja", "pluja feble", "aiguaneu", "neu", "cap", "no determinat"]
-        },
-        "visibilitat": {
-            "type": "string",
-            "enum": ["alta", "mitja", "baixa", "molt baixa"]
-        },
-        "vent_apparent": {
-            "type": "string",
-            "enum": ["calma", "lleuger", "moderat", "fort"]
-        },
-        "condició_general": {
-            "type": "string",
-            "enum": [
-                "assolellat", "parcialment ennuvolat", "ennuvolat",
-                "boirós", "plujós", "tempestuós", "nocturn"
-            ]
-        },
-        "observacions": {
-            "type": "string",
-            "maxLength": 100
-        }
-    },
-    "required": [
-        "cobertura_núvols",
-        "tipus_núvols",
-        "precipitació",
-        "tipus_precipitació",
-        "visibilitat",
-        "vent_apparent",
-        "condició_general",
-        "observacions"
-    ]
+{
+  "cobertura_núvols": <enter 0-100, percentatge aproximat del cel cobert>,
+  "tipus_núvols": <"sense núvols" | "cúmuls" | "estrats" | "cirrus" | "nimboestrats" | "cumulonimbus" | "no visible">,
+  "precipitació": <true | false>,
+  "tipus_precipitació": <"pluja" | "pluja feble" | "aiguaneu" | "neu" | "cap" | "no determinat">,
+  "visibilitat": <"alta" | "mitja" | "baixa" | "molt baixa">,
+  "vent_apparent": <"calma" | "lleuger" | "moderat" | "fort" — inferit de vegetació o objectes>,
+  "condició_general": <"assolellat" | "parcialment ennuvolat" | "ennuvolat" | "boirós" | "plujós" | "tempestuós" | "nocturn">,
+  "observacions": <string curt amb qualsevol detall rellevant, màxim 100 caràcters>
 }
 
-# ─── Utilitats ───────────────────────────────────────────────────────────────
+Si la imatge és nocturna o molt fosca, indica-ho a condició_general i omple els camps que puguis inferir."""
 
-def guess_media_type(path_imatge: Path) -> str:
-    suffix = path_imatge.suffix.lower()
-    if suffix == ".png":
-        return "image/png"
-    if suffix == ".webp":
-        return "image/webp"
-    return "image/jpeg"
+# ─── Notificació HA ──────────────────────────────────────────────────────────
 
-def normalitza_dades(dades: dict) -> dict:
-    """
-    Ajusta valors límit i comprova enums.
-    Si algun camp no és vàlid, llença ValueError.
-    """
-    if not isinstance(dades, dict):
-        raise ValueError("La resposta no és un objecte JSON")
-
-    # cobertura_núvols
-    cobertura = dades.get("cobertura_núvols")
-    if not isinstance(cobertura, int):
-        raise ValueError("cobertura_núvols no és enter")
-    dades["cobertura_núvols"] = max(0, min(100, cobertura))
-
-    # precipitació
-    if not isinstance(dades.get("precipitació"), bool):
-        raise ValueError("precipitació no és booleà")
-
-    # enums
-    if dades.get("tipus_núvols") not in TIPUS_NUVOLS:
-        raise ValueError(f"tipus_núvols invàlid: {dades.get('tipus_núvols')}")
-
-    if dades.get("tipus_precipitació") not in TIPUS_PRECIP:
-        raise ValueError(f"tipus_precipitació invàlid: {dades.get('tipus_precipitació')}")
-
-    if dades.get("visibilitat") not in VISIBILITAT:
-        raise ValueError(f"visibilitat invàlida: {dades.get('visibilitat')}")
-
-    if dades.get("vent_apparent") not in VENT:
-        raise ValueError(f"vent_apparent invàlid: {dades.get('vent_apparent')}")
-
-    if dades.get("condició_general") not in CONDICIO_GENERAL:
-        raise ValueError(f"condició_general invàlida: {dades.get('condició_general')}")
-
-    observacions = dades.get("observacions")
-    if not isinstance(observacions, str):
-        raise ValueError("observacions no és string")
-    dades["observacions"] = observacions[:100]
-
-    return dades
-
-# ─── Anàlisi amb ChatGPT ─────────────────────────────────────────────────────
-
-def analitza_imatge(path_imatge: Path) -> dict:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("No s'ha definit OPENAI_API_KEY")
-
-    client = OpenAI(api_key=api_key)
-
-    image_bytes = path_imatge.read_bytes()
-    media_type = guess_media_type(path_imatge)
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    image_data_url = f"data:{media_type};base64,{image_b64}"
-
-    response = client.responses.create(
-        model=MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": PROMPT
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                        "detail": "high"
-                    }
-                ]
-            }
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "analisi_meteorologica",
-                "schema": ANALYSIS_SCHEMA,
-                "strict": True
-            }
-        }
-    )
-
-    text = response.output_text.strip()
-    dades = json.loads(text)
-    return normalitza_dades(dades)
-
-# ─── Notificació a Home Assistant ─────────────────────────────────────────────
- 
 def notifica_ha():
     try:
-        import requests
         r = requests.post(HA_WEBHOOK_URL, timeout=5)
         log.info(f"Webhook HA enviat: {r.status_code}")
     except Exception as e:
         log.warning(f"Webhook HA fallat (no crític): {e}")
-
-
-# ─── es de dia ────────────────────────────────────────────────────────────────────
 
 def es_de_dia():
     try:
@@ -323,14 +149,19 @@ def es_de_dia():
         log.warning(f"No s'ha pogut consultar el sol: {e} — assumint de dia")
         return True
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", 
+    parser.add_argument("--force",    action="store_true",
                         help="Analitza ara independentment del comptador")
+    parser.add_argument("--provider", default=None,
+                        help="Proveïdor LLM: claude, openai, local (per defecte: METEO_PROVIDER_PROD)")
     args = parser.parse_args()
-    
+
+    provider = get_provider(args.provider) if args.provider else PROVIDER_PROD
+    log.info(f"Proveïdor: {provider}")
+
     init_db()
     estat = llegeix_estat()
 
@@ -354,24 +185,22 @@ def main():
     estat["comptador"] = 0
     estat["última_anàlisi"] = datetime.now().isoformat()
     desa_estat(estat)
-    notifica_ha() # per avisar dels canvis si es forçat
+    notifica_ha()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log.info(f"Analitzant {latest} ...")
+    log.info(f"Analitzant {latest} amb {provider}...")
 
     try:
-        dades = analitza_imatge(latest)
-        desa_analisi(timestamp, latest, dades)
+        dades = llm_vision(latest, PROMPT, provider=provider)
+        desa_analisi(timestamp, latest, dades, provider)
+        notifica_ha()
         log.info(
-            f"OK — {dades.get('condició_general')} | "
+            f"OK [{provider}] — {dades.get('condició_general')} | "
             f"núvols: {dades.get('cobertura_núvols')}% | "
             f"precipitació: {dades.get('precipitació')}"
         )
     except json.JSONDecodeError as e:
-        log.error(f"Error parsejant JSON de ChatGPT: {e}")
-        sys.exit(1)
-    except ValueError as e:
-        log.error(f"Resposta JSON invàlida: {e}")
+        log.error(f"Error parsejant JSON: {e}")
         sys.exit(1)
     except Exception as e:
         log.error(f"Error inesperat: {e}")

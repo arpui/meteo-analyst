@@ -16,6 +16,9 @@ load_dotenv("/opt/meteo-analyst/.env")
 
 app = Flask(__name__)
 
+# Proveïdor de producció — determina quin LLM usa HA
+PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
+
 # BD unificada al directori mountbind (persistent a Debian)
 DB_PATH  = Path("/data/meteo/meteo.db")
 BASE_DIR = Path("/data/meteo")
@@ -32,8 +35,8 @@ def latest():
     """Última anàlisi visual — el que llegirà Home Assistant"""
     conn = get_db()
     row = conn.execute("""
-        SELECT * FROM analisis ORDER BY id DESC LIMIT 1
-    """).fetchone()
+        SELECT * FROM analisis WHERE provider = ? ORDER BY id DESC LIMIT 1
+    """, (PROVIDER_PROD,)).fetchone()
     conn.close()
 
     if not row:
@@ -58,9 +61,9 @@ def avui():
     avui_str = datetime.now().strftime("%Y-%m-%d")
     rows = conn.execute("""
         SELECT * FROM analisis
-        WHERE timestamp LIKE ?
+        WHERE timestamp LIKE ? AND provider = ?
         ORDER BY id DESC
-    """, (f"{avui_str}%",)).fetchall()
+    """, (f"{avui_str}%", PROVIDER_PROD)).fetchall()
     conn.close()
 
     if not rows:
@@ -111,7 +114,8 @@ def analitza_ara():
         if result.returncode == 0:
             conn = get_db()
             row = conn.execute(
-                "SELECT * FROM analisis ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM analisis WHERE provider = ? ORDER BY id DESC LIMIT 1",
+                (PROVIDER_PROD,)
             ).fetchone()
             conn.close()
             return jsonify({
@@ -260,12 +264,201 @@ def health():
     conn = get_db()
     n_readings = conn.execute("SELECT COUNT(*) FROM meteo_readings").fetchone()[0]
     n_analisis = conn.execute("SELECT COUNT(*) FROM analisis").fetchone()[0]
+    try:
+        n_sky = conn.execute("SELECT COUNT(*) FROM sky_classifications").fetchone()[0]
+    except Exception:
+        n_sky = 0
     conn.close()
     return jsonify({
         "status":      "ok",
         "readings":    n_readings,
         "analisis":    n_analisis,
+        "sky_classifications": n_sky,
     })
+
+
+@app.route("/meteo/foto/<date_dir>/<nom_fitxer>")
+def serve_foto(date_dir, nom_fitxer):
+    """Serveix una foto per path: /meteo/foto/20260414/snapshot_070001.jpg"""
+    foto = BASE_DIR / date_dir / nom_fitxer
+    if not foto.exists():
+        return "foto no trobada", 404
+    return send_file(foto, mimetype="image/jpeg")
+
+
+@app.route("/meteo/validacio")
+def validacio():
+    """
+    Pàgina HTML per validar classificacions: foto + dades costat a costat
+    ?data=20260414  ?limit=50  ?nocturnes=1  ?tot=1
+    """
+    from flask import request
+
+    data      = request.args.get("data")
+    limit     = int(request.args.get("limit", 20))
+    nocturnes = request.args.get("nocturnes", "0") == "1"
+    tot       = request.args.get("tot", "0") == "1"
+
+    filtres = []
+    params  = []
+
+    if data:
+        filtres.append("timestamp LIKE ?")
+        params.append(f"{data[:4]}-{data[4:6]}-{data[6:8]}%")
+
+    if not tot:
+        if not nocturnes:
+            filtres.append("imatge_nocturna = 0")
+        filtres.append("qualitat_imatge != 'dolenta'")
+
+    where = f"WHERE {' AND '.join(filtres)}" if filtres else ""
+
+    params.append(limit)
+
+    conn = get_db()
+
+    # Pas 1: sky_classifications filtrades
+    sky_rows = conn.execute(f"""
+        SELECT * FROM sky_classifications
+        {where}
+        ORDER BY id DESC LIMIT ?
+    """, params).fetchall()
+
+    # Pas 2: per cada fila, busca el sensor més proper
+    rows = []
+    for r in sky_rows:
+        m = conn.execute("""
+            SELECT temp_outdoor, humidity, pressure_rel, wind_speed, rain_rate
+            FROM meteo_readings
+            WHERE timestamp BETWEEN
+                datetime(?, '-10 minutes') AND
+                datetime(?, '+10 minutes')
+            ORDER BY ABS(strftime('%s', timestamp) - strftime('%s', ?))
+            LIMIT 1
+        """, (r["timestamp"], r["timestamp"], r["timestamp"])).fetchone()
+        rows.append((r, m))
+
+    conn.close()
+    conn.close()
+
+    if not rows:
+        return "<h2>Sense classificacions encara</h2>", 404
+
+    cards = ""
+    for r, m in rows:
+        fitxer   = Path(r["fitxer"])
+        date_dir = fitxer.parent.name
+        nom      = fitxer.name
+        foto_url = f"/meteo/foto/{date_dir}/{nom}"
+
+        raw = json.loads(r["raw_json"]) if r["raw_json"] else {}
+        obs = raw.get("observacions", "")
+
+        cob = r["cobertura_pct"] or 0
+        if cob < 25:   badge_cob = "#27ae60"
+        elif cob < 60: badge_cob = "#f39c12"
+        else:          badge_cob = "#7f8c8d"
+
+        # Confiança color
+        conf = r["confianca_total"]
+        if conf is None:   conf_color = "#555"
+        elif conf >= 80:   conf_color = "#27ae60"
+        elif conf >= 60:   conf_color = "#f39c12"
+        else:              conf_color = "#e74c3c"
+        conf_text = f"{conf}%" if conf is not None else "—"
+
+        # Sensors
+        temp  = f"{m['temp_outdoor']:.1f}°C" if m and m["temp_outdoor"] is not None else "—"
+        hum   = f"{m['humidity']:.0f}%" if m and m["humidity"] is not None else "—"
+        pres  = f"{m['pressure_rel']:.0f} hPa" if m and m["pressure_rel"] is not None else "—"
+        vent  = f"{m['wind_speed']:.1f} km/h" if m and m["wind_speed"] is not None else "—"
+        pluja = f"{m['rain_rate']:.1f} mm/h" if m and m["rain_rate"] is not None else "—"
+
+        # Delta pressió
+        dp = r["delta_pressio_1h"]
+        if dp is not None:
+            signe = "+" if dp >= 0 else ""
+            dp_color = "#27ae60" if dp > 0.5 else ("#e74c3c" if dp < -0.5 else "#aaa")
+            dp_text = f'<span style="color:{dp_color}">{signe}{dp:.1f} hPa/h</span>'
+        else:
+            dp_text = "—"
+
+        # Flags
+        flags = []
+        if r["precipitacio_visual"]: flags.append("🌧 pluja")
+        if r["neu_visual"]:          flags.append("❄ neu")
+        if r["presencia_boira"]:     flags.append("🌫 boira")
+        if r["presencia_contrail"]:  flags.append("✈ contrail")
+        if r["gotes_objectiu"]:      flags.append("💧 obj.")
+        flags_html = " &nbsp;".join(flags) if flags else "—"
+
+        provider_badge = r["provider"] or "claude"
+
+        cards += f"""
+        <div class="card">
+            <div class="foto">
+                <img src="{foto_url}" alt="{nom}" loading="lazy">
+                <div class="timestamp">{r["timestamp"]}</div>
+            </div>
+            <div class="dades">
+                <div class="fila cap">
+                    <span class="badge" style="background:{badge_cob}">☁ {cob}% cobert</span>
+                    <span class="badge" style="background:#2980b9">☀ {r["cel_visible_pct"] or 0}% lliure</span>
+                    <span class="badge" style="background:{conf_color}">⚡ {conf_text}</span>
+                    <span class="badge" style="background:#555;font-size:0.7em">{provider_badge}</span>
+                </div>
+                <table>
+                    <tr><td>Núvol</td><td><b>{r["genere_nubol"] or "—"}</b> / {r["altura_nubol"] or "—"} / {r["textura_nubol"] or "—"}</td></tr>
+                    <tr><td>Color / Llum</td><td>{r["color_cel"] or "—"} / {r["intensitat_llum"] or "—"}</td></tr>
+                    <tr><td>Boira / Contrail</td><td>{("✓ boira" if r["presencia_boira"] else "—")} / {("✓ contrail" if r["presencia_contrail"] else "—")}</td></tr>
+                    <tr><td>Precipitació / Neu</td><td>{("🌧 sí" if r["precipitacio_visual"] else "—")} / {("❄ sí" if r["neu_visual"] else "—")}</td></tr>
+                    <tr><td>Objectiu</td><td>{r["objectiu_net"] or "—"} {("💧" if r["gotes_objectiu"] else "")}</td></tr>
+                    <tr><td>Qualitat</td><td>{r["qualitat_imatge"] or "—"}</td></tr>
+                    <tr style="background:#0a1628"><td colspan="2" style="color:#7fb3d3;padding-top:5px">⬡ Sensors</td></tr>
+                    <tr><td>Temp / Hum / Pressió</td><td>{temp} / {hum} / {pres}</td></tr>
+                    <tr><td>Vent / Pluja sensor</td><td>{vent} / {pluja}</td></tr>
+                    <tr><td>Δ Pressió 1h</td><td>{dp_text}</td></tr>
+                    <tr><td>Confiança LLM / Coh.</td><td>{r["confianca_llm"] or "—"} / {r["confianca_coherencia"] or "—"}</td></tr>
+                    {"<tr><td>Observacions</td><td><i>" + obs + "</i></td></tr>" if obs else ""}
+                </table>
+            </div>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="ca">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Validacio classificacions cel</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #1a1a2e; color: #eee; padding: 20px; }}
+        h1 {{ text-align: center; margin-bottom: 24px; font-size: 1.4em; color: #a8d8ea; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(580px, 1fr)); gap: 20px; }}
+        .card {{ background: #16213e; border-radius: 12px; overflow: hidden;
+                 display: flex; flex-direction: row; border: 1px solid #0f3460; }}
+        .foto {{ position: relative; width: 240px; min-width: 240px; }}
+        .foto img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+        .timestamp {{ position: absolute; bottom: 0; left: 0; right: 0;
+                      background: rgba(0,0,0,0.75); font-size: 0.68em;
+                      padding: 3px 6px; text-align: center; color: #ccc; }}
+        .dades {{ padding: 10px; flex: 1; }}
+        .fila.cap {{ display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }}
+        .badge {{ padding: 3px 8px; border-radius: 20px; font-size: 0.75em;
+                  font-weight: bold; color: white; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.78em; }}
+        td {{ padding: 2px 5px; border-bottom: 1px solid #0f3460; }}
+        td:first-child {{ color: #a8d8ea; width: 42%; }}
+    </style>
+</head>
+<body>
+    <h1>🌤 Validacio classificacions — {len(rows)} resultats</h1>
+    <div class="grid">{cards}</div>
+</body>
+</html>"""
+
+    return html
 
 
 if __name__ == "__main__":
