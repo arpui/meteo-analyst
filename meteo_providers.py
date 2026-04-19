@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Mòdul compartit de proveïdors LLM per scripts meteorològics.
-Suporta: claude, openai, local (Ollama)
+Suporta: claude, openai, local (Ollama), gemini
 
 Ús des de qualsevol script:
     from meteo_providers import get_provider, llm_vision, llm_text
@@ -16,13 +16,14 @@ log = logging.getLogger(__name__)
 
 # ─── Proveïdors disponibles ───────────────────────────────────────────────────
 
-PROVIDERS = ["claude", "openai", "local"]
+PROVIDERS = ["claude", "openai", "local", "gemini"]
 
 # Models per defecte per proveïdor
 DEFAULT_MODELS = {
     "claude": "claude-haiku-4-5-20251001",
     "openai": "gpt-4o-mini",
-    "local":  "llava",  # model Ollama per defecte
+    "local":  "llava",
+    "gemini": "gemini-2.0-flash",
 }
 
 # URL per proveïdor local (Ollama)
@@ -69,6 +70,8 @@ def llm_vision(image_path: Path, prompt: str,
         return _vision_openai(image_path, prompt, model)
     elif provider == "local":
         return _vision_local(image_path, prompt, model)
+    elif provider == "gemini":
+        return _vision_gemini(image_path, prompt, model)
     else:
         raise ValueError(f"Proveïdor desconegut: {provider}. Opcions: {PROVIDERS}")
 
@@ -90,6 +93,8 @@ def llm_text(system: str, user: str,
         return _text_openai(system, user, model, max_tokens)
     elif provider == "local":
         return _text_local(system, user, model, max_tokens)
+    elif provider == "gemini":
+        return _text_gemini(system, user, model, max_tokens)
     else:
         raise ValueError(f"Proveïdor desconegut: {provider}. Opcions: {PROVIDERS}")
 
@@ -212,13 +217,85 @@ def _text_local(system: str, user: str, model: str, max_tokens: int) -> str:
     return r.json()["response"].strip()
 
 
+# ─── Implementacions Gemini ───────────────────────────────────────────────────
+
+def _vision_gemini(image_path: Path, prompt: str, model: str) -> dict:
+    """
+    Vision via Google Gemini API (google-genai SDK).
+    Requereix: pip install google-genai
+    Requereix variable d'entorn: GEMINI_API_KEY
+    """
+    from google import genai
+    from google.genai import types
+
+    client     = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    image_data = base64.standard_b64encode(image_path.read_bytes()).decode("utf-8")
+
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(parts=[
+                types.Part(inline_data=types.Blob(
+                    mime_type="image/jpeg",
+                    data=image_data,
+                )),
+                types.Part(text=prompt),
+            ])
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+        ),
+    )
+    return _parse_json(response.text)
+
+
+def _text_gemini(system: str, user: str, model: str, max_tokens: int) -> str:
+    """
+    Text via Google Gemini API.
+    Requereix: pip install google-genai
+    Requereix variable d'entorn: GEMINI_API_KEY
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=max_tokens,
+            temperature=0.3,
+        ),
+    )
+    return response.text.strip()
+
+
 # ─── Utils ────────────────────────────────────────────────────────────────────
 
 def _parse_json(text: str) -> dict:
     """Neteja i parseja JSON de la resposta d'un LLM."""
+    import re
     text = text.strip()
+    # Elimina blocs de codi ```json ... ``` o ``` ... ```
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+        text = text.strip()
+    # Elimina comentaris // fins a final de línia (Gemini els afegeix de vegades)
+    text = re.sub(r'//[^\n]*', '', text)
+    # Elimina comentaris /* ... */
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    # Substitueix cometes simples per dobles (amb cura de no trencar contraccions)
+    # només quan envolten keys/values JSON
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Últim recurs: agafa només el bloc {} més extern
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        raise

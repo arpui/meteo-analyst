@@ -18,6 +18,7 @@ from pathlib import Path
 HA_URL   = "http://192.168.31.228:8123"
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 DB_PATH  = Path("/data/meteo/meteo.db")
+STATION  = os.environ.get("METEO_STATION", "torrelles")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +70,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS meteo_readings (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp        TEXT NOT NULL,
+            station          TEXT NOT NULL DEFAULT 'torrelles',
             -- Temperatura
             temp_outdoor     REAL,
             temp_feel        REAL,
@@ -98,6 +100,22 @@ def init_db():
             rain_daily_piezo REAL
         )
     """)
+    # Migració: afegeix columna station si no existeix (BD ja existent)
+    try:
+        conn.execute("ALTER TABLE meteo_readings ADD COLUMN station TEXT NOT NULL DEFAULT 'torrelles'")
+        conn.commit()
+        log.info("Migració BD: columna 'station' afegida")
+    except Exception:
+        pass
+    # Índex per consultes freqüents per station + timestamp
+    try:
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_readings_station_ts
+            ON meteo_readings (station, timestamp)
+        """)
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -105,7 +123,7 @@ def desa_lectura(dades: dict):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT INTO meteo_readings (
-            timestamp,
+            timestamp, station,
             temp_outdoor, temp_feel, temp_dewpoint, temp_indoor, temp_indoor_dew,
             humidity, humidity_indoor,
             pressure_abs, pressure_rel, vpd,
@@ -113,7 +131,7 @@ def desa_lectura(dades: dict):
             solar_radiation, solar_lux, uv_index,
             rain_rate, rain_hourly, rain_daily, rain_daily_piezo
         ) VALUES (
-            :timestamp,
+            :timestamp, :station,
             :temp_outdoor, :temp_feel, :temp_dewpoint, :temp_indoor, :temp_indoor_dew,
             :humidity, :humidity_indoor,
             :pressure_abs, :pressure_rel, :vpd,
@@ -149,7 +167,10 @@ def recull_sensors() -> dict:
         "Content-Type": "application/json",
     })
 
-    dades = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    dades = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "station":   STATION,
+    }
     for camp, entity_id in SENSORS.items():
         dades[camp] = get_sensor(session, entity_id)
         log.debug(f"  {camp}: {dades[camp]}")
@@ -165,12 +186,12 @@ def main():
 
     init_db()
 
-    log.info("Recollint sensors Ecowitt...")
+    log.info(f"Recollint sensors Ecowitt [{STATION}]...")
     dades = recull_sensors()
 
     desa_lectura(dades)
     log.info(
-        f"OK — {dades['timestamp']} | "
+        f"OK [{STATION}] — {dades['timestamp']} | "
         f"T: {dades['temp_outdoor']}°C | "
         f"H: {dades['humidity']}% | "
         f"Vent: {dades['wind_speed']} km/h | "

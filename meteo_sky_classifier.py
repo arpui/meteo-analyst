@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+# Versió: 2026-04-19 19:00
 """
 Classificador del cel i núvols per fotos meteorològiques
 Processa fotos históries i noves, enriqueix la BD amb classificacions detallades
 Ús: python3 meteo_sky_classifier.py [--data YYYYMMDD] [--dies N] [--force]
+     [--limit N] [--interval N] [--station STATION] [--provider PROV] [--model MODEL]
 """
 import os
 import re
@@ -22,7 +24,8 @@ from meteo_providers import get_provider, get_model, llm_vision
 # ─── Configuració ────────────────────────────────────────────────────────────
 
 DB_PATH  = Path("/data/meteo/meteo.db")
-BASE_DIR = Path("/data/meteo")
+STATION  = os.environ.get("METEO_STATION", "torrelles")
+BASE_DIR = Path(f"/data/meteo/{STATION}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +52,7 @@ NOVES_COLUMNES = [
     ("temp_moment",          "REAL"),
     ("provider",             "TEXT DEFAULT 'claude'"),
     ("model",                "TEXT DEFAULT 'claude-haiku-4-5-20251001'"),
+    ("station",              "TEXT DEFAULT 'torrelles'"),
 ]
 
 def init_db():
@@ -81,6 +85,7 @@ def init_db():
             temp_moment          REAL,
             provider             TEXT DEFAULT 'claude',
             model                TEXT DEFAULT 'claude-haiku-4-5-20251001',
+            station              TEXT DEFAULT 'torrelles',
             raw_json             TEXT
         )
     """)
@@ -90,12 +95,6 @@ def init_db():
             conn.commit()
         except Exception:
             pass
-    # Migració columna model
-    try:
-        conn.execute("ALTER TABLE sky_classifications ADD COLUMN model TEXT DEFAULT 'claude-haiku-4-5-20251001'")
-        conn.commit()
-    except Exception:
-        pass
     # Clau única composta (fitxer + provider + model)
     try:
         conn.execute("DROP INDEX IF EXISTS idx_fitxer_provider")
@@ -128,7 +127,7 @@ def _confianca_total(dades: dict, sensors: dict):
 
 def desa_classificacio(timestamp: str, fitxer: str, dades: dict,
                         provider: str = "claude", model: str = "",
-                        sensors: dict = None):
+                        sensors: dict = None, station: str = "torrelles"):
     sensors = sensors or {}
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -143,8 +142,8 @@ def desa_classificacio(timestamp: str, fitxer: str, dades: dict,
             imatge_nocturna, qualitat_imatge,
             confianca_llm, confianca_coherencia, confianca_total,
             delta_pressio_1h, rain_rate_moment, temp_moment,
-            provider, model, raw_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            provider, model, station, raw_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         timestamp, str(fitxer),
         dades.get("cel_visible_pct"),
@@ -170,6 +169,7 @@ def desa_classificacio(timestamp: str, fitxer: str, dades: dict,
         sensors.get("temp_moment"),
         provider,
         model,
+        station,
         json.dumps(dades, ensure_ascii=False)
     ))
     conn.commit()
@@ -177,27 +177,27 @@ def desa_classificacio(timestamp: str, fitxer: str, dades: dict,
 
 # ─── Sensors del moment ───────────────────────────────────────────────────────
 
-def sensors_del_moment(timestamp: str) -> dict:
+def sensors_del_moment(timestamp: str, station: str = "torrelles") -> dict:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
     row = conn.execute("""
         SELECT * FROM meteo_readings
-        WHERE timestamp BETWEEN
+        WHERE station = ? AND timestamp BETWEEN
             datetime(?, '-10 minutes') AND
             datetime(?, '+10 minutes')
         ORDER BY ABS(strftime('%s', timestamp) - strftime('%s', ?))
         LIMIT 1
-    """, (timestamp, timestamp, timestamp)).fetchone()
+    """, (station, timestamp, timestamp, timestamp)).fetchone()
 
     row_1h = conn.execute("""
         SELECT pressure_abs FROM meteo_readings
-        WHERE timestamp BETWEEN
+        WHERE station = ? AND timestamp BETWEEN
             datetime(?, '-70 minutes') AND
             datetime(?, '-50 minutes')
         ORDER BY ABS(strftime('%s', timestamp) - strftime('%s', datetime(?, '-1 hour')))
         LIMIT 1
-    """, (timestamp, timestamp, timestamp)).fetchone()
+    """, (station, timestamp, timestamp, timestamp)).fetchone()
 
     conn.close()
 
@@ -332,7 +332,7 @@ def fitxers_del_dia(date_dir: str, nomes_diurnes: bool = True) -> list[Path]:
     if not dia_path.exists():
         return []
     fitxers = sorted([
-        f for f in dia_path.glob("snapshot_*.jpg")
+        f for f in dia_path.glob("snapshot*.jpg")
         if "latest" not in f.name
     ])
     if nomes_diurnes:
@@ -349,38 +349,104 @@ def fitxers_periode(dies: int) -> list[tuple[str, Path]]:
             resultat.append((date_dir, f))
     return resultat
 
+# ─── Subsampling per interval ─────────────────────────────────────────────────
+
+def aplica_interval(parells: list[tuple[str, Path]], interval_min: int) -> list[tuple[str, Path]]:
+    """Una foto cada interval_min minuts com a màxim."""
+    if interval_min <= 0:
+        return parells
+
+    with_ts: list[tuple[str, Path, datetime]] = []
+    for date_dir, fitxer in parells:
+        ts_str = extreu_timestamp(fitxer, date_dir)
+        ts     = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        with_ts.append((date_dir, fitxer, ts))
+
+    if not with_ts:
+        return []
+
+    resultat: list[tuple[str, Path]] = []
+    darrer_ts = with_ts[0][2]
+    resultat.append((with_ts[0][0], with_ts[0][1]))
+
+    for date_dir, fitxer, ts in with_ts[1:]:
+        if (ts - darrer_ts).total_seconds() / 60 >= interval_min:
+            resultat.append((date_dir, fitxer))
+            darrer_ts = ts
+
+    return resultat
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Classificador del cel per fotos meteorològiques",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples:
+  %(prog)s --data 20260418
+  %(prog)s --data 20260418 --interval 15
+  %(prog)s --data 20251227 --station espui --interval 60 --provider gemini
+  %(prog)s --dies 7 --interval 15 --limit 50
+  %(prog)s --data 20260418 --provider openai --model gpt-4o
+        """
+    )
     parser.add_argument("--data",     help="Dia concret (YYYYMMDD)")
-    parser.add_argument("--dies",     type=int, default=1)
-    parser.add_argument("--force",    action="store_true")
-    parser.add_argument("--limit",    type=int, default=0)
+    parser.add_argument("--dies",     type=int, default=1,
+                        help="Nombre de dies cap enrere (per defecte 1)")
+    parser.add_argument("--force",    action="store_true",
+                        help="Reclassifica encara que ja existeixi")
+    parser.add_argument("--limit",    type=int, default=0,
+                        help="Màxim de fotos a processar (0 = sense límit)")
+    parser.add_argument("--interval", type=int, default=0,
+                        help="Subsampling: una foto cada N minuts (0 = totes)")
+    parser.add_argument("--station",  default=None,
+                        help="torrelles | espui (per defecte: METEO_STATION)")
     parser.add_argument("--provider", default=None,
-                        help="claude|openai|local")
-    parser.add_argument("--model", default=None,
+                        help="claude | openai | gemini | local")
+    parser.add_argument("--model",    default=None,
                         help="Model específic (sobreescriu METEO_MODEL_<PROVIDER>)")
     args = parser.parse_args()
+
     args.provider   = get_provider(args.provider)
     args.model_name = get_model(args.provider, args.model)
+    args.station    = args.station or STATION
+    global BASE_DIR
+    BASE_DIR        = Path(f"/data/meteo/{args.station}")
 
     init_db()
 
+    # ── Recull fitxers ────────────────────────────────────────────────────────
     if args.data:
         parells = [(args.data, f) for f in fitxers_del_dia(args.data)]
     else:
         parells = fitxers_periode(args.dies)
 
     if not parells:
-        log.warning("No s'han trobat fitxers")
+        log.warning(f"No s'han trobat fitxers a {BASE_DIR}")
         return
 
-    log.info(f"Fitxers: {len(parells)} | Provider: {args.provider}")
+    total_original = len(parells)
 
+    # ── Subsampling per interval ──────────────────────────────────────────────
+    if args.interval > 0:
+        parells = aplica_interval(parells, args.interval)
+        log.info(
+            f"Interval {args.interval}min: {total_original} → {len(parells)} fotos "
+            f"({total_original - len(parells)} omeses)"
+        )
+
+    # ── Límit ─────────────────────────────────────────────────────────────────
     if args.limit:
         parells = parells[:args.limit]
-        log.info(f"Limit: {len(parells)} fotos")
+
+    log.info(
+        f"Fitxers a processar: {len(parells)} | "
+        f"Provider: {args.provider}/{args.model_name} | "
+        f"Estació: {args.station}"
+        + (f" | Interval: {args.interval}min" if args.interval else "")
+        + (f" | Limit: {args.limit}" if args.limit else "")
+    )
 
     ok = errors = saltats = 0
 
@@ -393,11 +459,11 @@ def main():
 
         try:
             dades   = classifica_imatge(fitxer, timestamp, provider=args.provider, model=args.model_name)
-            sensors = sensors_del_moment(timestamp)
+            sensors = sensors_del_moment(timestamp, station=args.station)
             sensors["confianca_coherencia"] = calcula_coherencia(dades, sensors)
             desa_classificacio(timestamp, fitxer, dades,
                                provider=args.provider, model=args.model_name,
-                               sensors=sensors)
+                               sensors=sensors, station=args.station)
             log.info(
                 f"OK [{args.provider}/{args.model_name}] {fitxer.name} | "
                 f"cel:{dades.get('cel_visible_pct')}% | "

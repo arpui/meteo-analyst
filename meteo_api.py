@@ -12,6 +12,7 @@ from datetime import datetime
 from flask import Flask, jsonify, send_file
 from dotenv import load_dotenv
 
+# Versió: 2026-04-19 19:30
 load_dotenv("/opt/meteo-analyst/.env")
 
 app = Flask(__name__)
@@ -21,7 +22,8 @@ PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
 
 # BD unificada al directori mountbind (persistent a Debian)
 DB_PATH  = Path("/data/meteo/meteo.db")
-BASE_DIR = Path("/data/meteo")
+STATION  = os.environ.get("METEO_STATION", "torrelles")
+BASE_DIR = Path(f"/data/meteo/{STATION}")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -286,6 +288,15 @@ def serve_foto(date_dir, nom_fitxer):
     return send_file(foto, mimetype="image/jpeg")
 
 
+@app.route("/meteo/foto/abs/<path:fitxer_path>")
+def serve_foto_abs(fitxer_path):
+    """Serveix una foto pel path absolut: /meteo/foto/abs/data/meteo/espui/20251227/snap.jpg"""
+    foto = Path("/") / fitxer_path
+    if not foto.exists():
+        return "foto no trobada", 404
+    return send_file(foto, mimetype="image/jpeg")
+
+
 @app.route("/meteo/validacio")
 def validacio():
     """
@@ -407,7 +418,7 @@ def validacio():
             fitxer   = Path(fitxer_key)
             date_dir = fitxer.parent.name
             nom      = fitxer.name
-            foto_url = f"/meteo/foto/{date_dir}/{nom}"
+            foto_url = f"/meteo/foto/abs{r['fitxer']}"
             ts       = classificacions[0][0]["timestamp"]
 
             # Sensors (agafem el primer que tingui dades)
@@ -478,7 +489,7 @@ def validacio():
             fitxer   = Path(r["fitxer"])
             date_dir = fitxer.parent.name
             nom      = fitxer.name
-            foto_url = f"/meteo/foto/{date_dir}/{nom}"
+            foto_url = f"/meteo/foto/abs{r['fitxer']}"
             cards += f"""
             <div class="card">
                 <div class="foto">

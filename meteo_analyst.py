@@ -2,7 +2,7 @@
 """
 Analitzador meteorològic amb Vision LLM
 Processa imatges de l'estació cada N captures i desa resultats a SQLite
-Suporta múltiples proveïdors: claude, openai, local
+Suporta múltiples proveïdors: claude, openai, local, gemini
 """
 import argparse
 import os
@@ -26,11 +26,12 @@ PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
 
 HA_WEBHOOK_URL = "http://192.168.31.228:8123/api/webhook/meteo_update"
 HA_URL         = "http://192.168.31.228:8123"
-BASE_DIR       = Path("/data/meteo")
 DB_PATH        = Path("/data/meteo/meteo.db")
 STATE_FILE     = Path("/opt/meteo-analyst/state.json")
 ANALYSE_EVERY  = 1
 HA_TOKEN       = os.environ.get("HA_TOKEN", "")
+STATION        = os.environ.get("METEO_STATION", "torrelles")
+BASE_DIR       = Path(f"/data/meteo/{STATION}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,19 +61,23 @@ def init_db():
             condició_general TEXT,
             observacions     TEXT,
             provider         TEXT DEFAULT 'claude',
+            station          TEXT DEFAULT 'torrelles',
             raw_json         TEXT
         )
     """)
-    # Afegeix columna provider si no existeix (migració BD existent)
-    try:
-        conn.execute("ALTER TABLE analisis ADD COLUMN provider TEXT DEFAULT 'claude'")
-        conn.commit()
-    except Exception:
-        pass
+    for col, defval in [
+        ("provider", "'claude'"),
+        ("station",  "'torrelles'"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE analisis ADD COLUMN {col} TEXT DEFAULT {defval}")
+            conn.commit()
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
-def desa_analisi(timestamp, imatge, dades, provider):
+def desa_analisi(timestamp, imatge, dades, provider, station):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         INSERT INTO analisis (
@@ -81,8 +86,8 @@ def desa_analisi(timestamp, imatge, dades, provider):
             precipitació, tipus_precipit,
             visibilitat, vent_apparent,
             condició_general, observacions,
-            provider, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider, station, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         timestamp, str(imatge),
         dades.get("cobertura_núvols"),
@@ -94,6 +99,7 @@ def desa_analisi(timestamp, imatge, dades, provider):
         dades.get("condició_general"),
         dades.get("observacions"),
         provider,
+        station,
         json.dumps(dades, ensure_ascii=False)
     ))
     conn.commit()
@@ -156,18 +162,23 @@ def main():
     parser.add_argument("--force",    action="store_true",
                         help="Analitza ara independentment del comptador")
     parser.add_argument("--provider", default=None,
-                        help="Proveïdor LLM: claude, openai, local (per defecte: METEO_PROVIDER_PROD)")
+                        help="Proveïdor LLM: claude, openai, gemini, local")
+    parser.add_argument("--station",  default=None,
+                        help="Estació: torrelles | espui (per defecte: METEO_STATION)")
     args = parser.parse_args()
 
     provider = get_provider(args.provider) if args.provider else PROVIDER_PROD
-    log.info(f"Proveïdor: {provider}")
+    station  = args.station or STATION
+    base_dir = Path(f"/data/meteo/{station}")
+
+    log.info(f"Proveïdor: {provider} | Estació: {station}")
 
     init_db()
     estat = llegeix_estat()
 
-    latest = BASE_DIR / "latest.jpg"
+    latest = base_dir / "latest.jpg"
     if not latest.exists():
-        log.warning("No s'ha trobat /data/meteo/latest.jpg — esperant captures")
+        log.warning(f"No s'ha trobat {latest} — esperant captures")
         sys.exit(0)
 
     if not args.force and not es_de_dia():
@@ -192,10 +203,10 @@ def main():
 
     try:
         dades = llm_vision(latest, PROMPT, provider=provider)
-        desa_analisi(timestamp, latest, dades, provider)
+        desa_analisi(timestamp, latest, dades, provider, station)
         notifica_ha()
         log.info(
-            f"OK [{provider}] — {dades.get('condició_general')} | "
+            f"OK [{provider}/{station}] — {dades.get('condició_general')} | "
             f"núvols: {dades.get('cobertura_núvols')}% | "
             f"precipitació: {dades.get('precipitació')}"
         )
