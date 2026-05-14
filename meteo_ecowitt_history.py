@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Versió: 2026-04-19 20:30
+# Versió: 2026-04-24 15:00
 """
 Recuperació d'historial de sensors via API Ecowitt cloud
 Insereix dades antigues a meteo_readings amb el camp station correcte
@@ -15,6 +15,7 @@ import sqlite3
 import logging
 import argparse
 import time
+import random
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,35 +46,39 @@ log = logging.getLogger(__name__)
 
 # ─── Conversions d'unitats ────────────────────────────────────────────────────
 
-def f_to_c(f):
-    """Fahrenheit → Celsius"""
-    if f is None:
-        return None
-    return round((float(f) - 32) * 5 / 9, 1)
-
-def mph_to_kmh(mph):
-    """mph → km/h"""
-    if mph is None:
-        return None
-    return round(float(mph) * 1.60934, 1)
-
-def inhg_to_hpa(inhg):
-    """inHg → hPa"""
-    if inhg is None:
-        return None
-    return round(float(inhg) * 33.8639, 1)
-
-def in_to_mm(inches):
-    """inches → mm"""
-    if inches is None:
-        return None
-    return round(float(inches) * 25.4, 1)
-
 def safe_float(val):
+    """Converteix a float, retorna None si no és numèric o és '-'"""
+    if val is None or val == '-' or val == '':
+        return None
     try:
         return float(val)
     except (TypeError, ValueError):
         return None
+
+def f_to_c(f):
+    """Fahrenheit → Celsius"""
+    v = safe_float(f)
+    return round((v - 32) * 5 / 9, 1) if v is not None else None
+
+def mph_to_kmh(mph):
+    """mph → km/h"""
+    v = safe_float(mph)
+    return round(v * 1.60934, 1) if v is not None else None
+
+def inhg_to_hpa(inhg):
+    """inHg → hPa"""
+    v = safe_float(inhg)
+    return round(v * 33.8639, 1) if v is not None else None
+
+def in_to_mm(inches):
+    """inches → mm"""
+    v = safe_float(inches)
+    return round(v * 25.4, 1) if v is not None else None
+
+def mi_to_km(mi):
+    """milles → km"""
+    v = safe_float(mi)
+    return round(v * 1.60934, 1) if v is not None else None
 
 def calcula_vpd(temp_c, humitat_pct):
     """Calcula Vapour Pressure Deficit (kPa) a partir de temp i humitat."""
@@ -88,16 +93,16 @@ def calcula_vpd(temp_c, humitat_pct):
 
 def rad_to_lux(rad_wm2):
     """Conversió aproximada W/m² → lux per llum solar (factor ~120)."""
-    if rad_wm2 is None:
-        return None
-    return round(float(rad_wm2) * 120, 0)
+    v = safe_float(rad_wm2)
+    return round(v * 120, 0) if v is not None else None
 
 # ─── API Ecowitt ──────────────────────────────────────────────────────────────
 
-def fetch_period(mac: str, start: datetime, end: datetime) -> dict:
+def fetch_period(mac: str, start: datetime, end: datetime,
+                 max_retries: int = 3) -> dict:
     """
     Recupera dades d'un període (màx recomanat: 1 dia per crida).
-    Retorna dict amb les dades crues de l'API.
+    Retry automàtic amb backoff exponencial per rate limit (-1).
     """
     app_key = os.environ.get("ECOWITT_APP_KEY", "")
     api_key = os.environ.get("ECOWITT_API_KEY", "")
@@ -112,17 +117,28 @@ def fetch_period(mac: str, start: datetime, end: datetime) -> dict:
         "start_date":      start.strftime("%Y-%m-%d %H:%M:%S"),
         "end_date":        end.strftime("%Y-%m-%d %H:%M:%S"),
         "cycle_type":      "5min",
-        "call_back":       "outdoor,wind,pressure,rainfall,solar_and_uvi,indoor",
+        "call_back":       "outdoor,wind,pressure,rainfall,solar_and_uvi,indoor,lightning,temp_and_humidity_ch1",
     }
 
-    r = requests.get(f"{API_BASE}/device/history", params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    for intent in range(max_retries):
+        r = requests.get(f"{API_BASE}/device/history", params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
 
-    if data.get("code") != 0:
-        raise ValueError(f"API error: {data.get('msg')} (code {data.get('code')})")
+        code = data.get("code")
+        if code == 0:
+            return data.get("data", {})
 
-    return data.get("data", {})
+        # Rate limit: espera i reintenta
+        if code == -1:
+            espera = 60 * (intent + 1) + random.randint(5, 15)
+            log.warning(f"Rate limit (codi -1), esperant {espera}s (intent {intent+1}/{max_retries})...")
+            time.sleep(espera)
+            continue
+
+        raise ValueError(f"API error: {data.get('msg')} (code {code})")
+
+    raise ValueError(f"Rate limit persistent després de {max_retries} intents")
 
 def parse_readings(data: dict, station: str) -> list[dict]:
     """
@@ -181,6 +197,14 @@ def parse_readings(data: dict, station: str) -> list[dict]:
         rain_rate  = in_to_mm(get_val("rainfall", "rain_rate"))
         rain_daily = in_to_mm(get_val("rainfall", "daily"))
 
+        # Lightning (milles → km)
+        light_dist  = mi_to_km(get_val("lightning", "distance"))
+        light_count = safe_float(get_val("lightning", "count"))
+
+        # Temp/humitat CH1 (°F → °C)
+        temp_ch1_c = f_to_c(get_val("temp_and_humidity_ch1", "temperature"))
+        hum_ch1    = safe_float(get_val("temp_and_humidity_ch1", "humidity"))
+
         readings.append({
             "timestamp":        timestamp,
             "station":          station,
@@ -205,6 +229,10 @@ def parse_readings(data: dict, station: str) -> list[dict]:
             "rain_hourly":      None,
             "rain_daily":       rain_daily,
             "rain_daily_piezo": None,
+            "lightning_distance": light_dist,
+            "lightning_count":    int(light_count) if light_count is not None else None,
+            "temp_ch1":         temp_ch1_c,
+            "hum_ch1":          int(hum_ch1) if hum_ch1 is not None else None,
         })
 
     return readings
@@ -220,6 +248,18 @@ def init_db():
         log.info("Migració BD: columna 'station' afegida")
     except Exception:
         pass
+    # Migracions ch1 + lightning (no destructives)
+    for col, tipus in [
+        ("lightning_distance", "REAL"),
+        ("lightning_count",    "INTEGER"),
+        ("temp_ch1",           "REAL"),
+        ("hum_ch1",            "INTEGER"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE meteo_readings ADD COLUMN {col} {tipus}")
+            conn.commit()
+        except Exception:
+            pass
     try:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_readings_station_ts
@@ -256,7 +296,9 @@ def insereix_readings(readings: list[dict], dry_run: bool = False) -> tuple[int,
                     pressure_abs, pressure_rel, vpd,
                     wind_speed, wind_gust, wind_direction, wind_gust_max,
                     solar_radiation, solar_lux, uv_index,
-                    rain_rate, rain_hourly, rain_daily, rain_daily_piezo
+                    rain_rate, rain_hourly, rain_daily, rain_daily_piezo,
+                    lightning_distance, lightning_count,
+                    temp_ch1, hum_ch1
                 ) VALUES (
                     :timestamp, :station,
                     :temp_outdoor, :temp_feel, :temp_dewpoint, :temp_indoor, :temp_indoor_dew,
@@ -264,7 +306,9 @@ def insereix_readings(readings: list[dict], dry_run: bool = False) -> tuple[int,
                     :pressure_abs, :pressure_rel, :vpd,
                     :wind_speed, :wind_gust, :wind_direction, :wind_gust_max,
                     :solar_radiation, :solar_lux, :uv_index,
-                    :rain_rate, :rain_hourly, :rain_daily, :rain_daily_piezo
+                    :rain_rate, :rain_hourly, :rain_daily, :rain_daily_piezo,
+                    :lightning_distance, :lightning_count,
+                    :temp_ch1, :hum_ch1
                 )
             """, r)
         inserits += 1
@@ -295,6 +339,8 @@ Exemples:
                         help="Data fi (YYYY-MM-DD), per defecte avui")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simula sense escriure a la BD")
+    parser.add_argument("--sleep", type=float, default=2.0,
+                        help="Segons d'espera entre dies (defecte 2)")
     args = parser.parse_args()
 
     mac   = STATIONS[args.station]
@@ -331,7 +377,7 @@ Exemples:
             total_errors += 1
 
         dia_actual += timedelta(days=1)
-        time.sleep(0.5)  # respecta rate limit API
+        time.sleep(args.sleep + random.random())  # respecta rate limit API
 
     log.info(
         f"\nFet — Inserides: {total_inserits} | "

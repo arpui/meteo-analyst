@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Versió: 2026-04-19 19:00
+# Versió: 2026-04-21 13:00
 """
 Classificador del cel i núvols per fotos meteorològiques
 Processa fotos históries i noves, enriqueix la BD amb classificacions detallades
@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv("/opt/meteo-analyst/.env")
 sys.path.insert(0, "/opt/meteo-analyst")
 from meteo_providers import get_provider, get_model, llm_vision
+from meteo_solar import es_diurna as solar_es_diurna, hores_diurnes
 
 # ─── Configuració ────────────────────────────────────────────────────────────
 
@@ -317,17 +318,14 @@ def classifica_imatge(path: Path, timestamp: str, provider: str = None, model: s
     dades["_hora_context"] = dt.strftime("%H:%M")
     return dades
 
-# ─── Filtre horari ────────────────────────────────────────────────────────────
+# ─── Filtre horari (via meteo_solar.py) ─────────────────────────────────────
 
-HORA_INICI = 7
-HORA_FI    = 21
-
-def es_diurna(fitxer: Path, date_dir: str) -> bool:
+def es_diurna(fitxer: Path, date_dir: str, station: str = "torrelles") -> bool:
     timestamp = extreu_timestamp(fitxer, date_dir)
-    hora = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").hour
-    return HORA_INICI <= hora <= HORA_FI
+    return solar_es_diurna(timestamp, station)
 
-def fitxers_del_dia(date_dir: str, nomes_diurnes: bool = True) -> list[Path]:
+def fitxers_del_dia(date_dir: str, nomes_diurnes: bool = True,
+                    station: str = "torrelles") -> list[Path]:
     dia_path = BASE_DIR / date_dir
     if not dia_path.exists():
         return []
@@ -336,7 +334,7 @@ def fitxers_del_dia(date_dir: str, nomes_diurnes: bool = True) -> list[Path]:
         if "latest" not in f.name
     ])
     if nomes_diurnes:
-        fitxers = [f for f in fitxers if es_diurna(f, date_dir)]
+        fitxers = [f for f in fitxers if es_diurna(f, date_dir, station)]
     return fitxers
 
 def fitxers_periode(dies: int) -> list[tuple[str, Path]]:
@@ -345,7 +343,7 @@ def fitxers_periode(dies: int) -> list[tuple[str, Path]]:
     for i in range(0, dies + 1):
         data     = avui - timedelta(days=i)
         date_dir = data.strftime("%Y%m%d")
-        for f in fitxers_del_dia(date_dir):
+        for f in fitxers_del_dia(date_dir, station=args.station):
             resultat.append((date_dir, f))
     return resultat
 
@@ -418,7 +416,7 @@ Exemples:
 
     # ── Recull fitxers ────────────────────────────────────────────────────────
     if args.data:
-        parells = [(args.data, f) for f in fitxers_del_dia(args.data)]
+        parells = [(args.data, f) for f in fitxers_del_dia(args.data, station=args.station)]
     else:
         parells = fitxers_periode(args.dies)
 

@@ -1,3 +1,4 @@
+# Versió: 2026-04-24 13:00
 #!/usr/bin/env python3
 """
 API REST per exposar dades meteorològiques a Home Assistant
@@ -12,8 +13,10 @@ from datetime import datetime
 from flask import Flask, jsonify, send_file
 from dotenv import load_dotenv
 
-# Versió: 2026-04-19 19:30
 load_dotenv("/opt/meteo-analyst/.env")
+import sys
+sys.path.insert(0, "/opt/meteo-analyst")
+from meteo_solar import es_diurna as solar_es_diurna
 
 app = Flask(__name__)
 
@@ -22,8 +25,7 @@ PROVIDER_PROD = os.environ.get("METEO_PROVIDER_PROD", "claude")
 
 # BD unificada al directori mountbind (persistent a Debian)
 DB_PATH  = Path("/data/meteo/meteo.db")
-STATION  = os.environ.get("METEO_STATION", "torrelles")
-BASE_DIR = Path(f"/data/meteo/{STATION}")
+BASE_DIR = Path("/data/meteo")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -279,19 +281,23 @@ def health():
     })
 
 
-@app.route("/meteo/foto/<date_dir>/<nom_fitxer>")
-def serve_foto(date_dir, nom_fitxer):
-    """Serveix una foto per path: /meteo/foto/20260414/snapshot_070001.jpg"""
-    foto = BASE_DIR / date_dir / nom_fitxer
+@app.route("/dashboard")
+def dashboard():
+    return send_file("/opt/meteo-analyst/dashboard_meteo.html")
+
+
+@app.route("/meteo/foto/abs/<path:fitxer_path>")
+def serve_foto_abs(fitxer_path):
+    foto = Path("/") / fitxer_path
     if not foto.exists():
         return "foto no trobada", 404
     return send_file(foto, mimetype="image/jpeg")
 
 
-@app.route("/meteo/foto/abs/<path:fitxer_path>")
-def serve_foto_abs(fitxer_path):
-    """Serveix una foto pel path absolut: /meteo/foto/abs/data/meteo/espui/20251227/snap.jpg"""
-    foto = Path("/") / fitxer_path
+@app.route("/meteo/foto/<date_dir>/<nom_fitxer>")
+def serve_foto(date_dir, nom_fitxer):
+    """Serveix una foto per path: /meteo/foto/20260414/snapshot_070001.jpg"""
+    foto = BASE_DIR / date_dir / nom_fitxer
     if not foto.exists():
         return "foto no trobada", 404
     return send_file(foto, mimetype="image/jpeg")
@@ -418,7 +424,7 @@ def validacio():
             fitxer   = Path(fitxer_key)
             date_dir = fitxer.parent.name
             nom      = fitxer.name
-            foto_url = f"/meteo/foto/abs{r['fitxer']}"
+            foto_url = f"/meteo/foto/{date_dir}/{nom}"
             ts       = classificacions[0][0]["timestamp"]
 
             # Sensors (agafem el primer que tingui dades)
@@ -489,7 +495,7 @@ def validacio():
             fitxer   = Path(r["fitxer"])
             date_dir = fitxer.parent.name
             nom      = fitxer.name
-            foto_url = f"/meteo/foto/abs{r['fitxer']}"
+            foto_url = f"/meteo/foto/{date_dir}/{nom}"
             cards += f"""
             <div class="card">
                 <div class="foto">
@@ -543,6 +549,231 @@ def validacio():
 </html>"""
 
     return html
+
+
+
+# ─── Endpoints dashboard ──────────────────────────────────────────────────────
+
+@app.route("/meteo/sensors/latest")
+def sensors_latest():
+    """Última lectura de sensors per estació. ?station=torrelles|espui"""
+    from flask import request
+    station = request.args.get("station", "torrelles")
+    conn = get_db()
+    row = conn.execute("""
+        SELECT * FROM meteo_readings
+        WHERE station = ?
+        ORDER BY timestamp DESC LIMIT 1
+    """, (station,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "sense dades"}), 404
+    return jsonify(dict(row))
+
+
+@app.route("/meteo/sensors/historial24h")
+def sensors_historial24h():
+    """Lectures de les últimes 24h per estació. ?station=torrelles|espui"""
+    from flask import request
+    station = request.args.get("station", "torrelles")
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT timestamp, temp_outdoor, temp_feel, temp_dewpoint,
+               humidity, pressure_rel, pressure_abs,
+               wind_speed, wind_gust, wind_direction,
+               solar_radiation, uv_index, rain_rate, rain_daily,
+               lightning_distance, lightning_count,
+               temp_ch1, hum_ch1
+        FROM meteo_readings
+        WHERE station = ?
+          AND timestamp >= datetime('now', '-24 hours')
+        ORDER BY timestamp ASC
+    """, (station,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/meteo/fotos/dia")
+def fotos_dia():
+    """Fotos classificades d'un dia, una cada interval minuts. ?data=20260421&station=torrelles&interval=30"""
+    from flask import request
+    data     = request.args.get("data", datetime.now().strftime("%Y%m%d"))
+    station  = request.args.get("station", "torrelles")
+    interval = int(request.args.get("interval", 30))
+    limit    = int(request.args.get("limit", 48))
+
+    data_fmt = f"{data[:4]}-{data[4:6]}-{data[6:8]}"
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT timestamp, fitxer, genere_nubol, cobertura_pct,
+               cel_visible_pct, precipitacio_visual, neu_visual,
+               confianca_total, provider
+        FROM sky_classifications
+        WHERE timestamp LIKE ? AND station = ?
+          AND imatge_nocturna = 0
+        ORDER BY timestamp ASC
+    """, (f"{data_fmt}%", station)).fetchall()
+    conn.close()
+
+    if not rows:
+        return jsonify([])
+
+    resultat = []
+    darrer_ts = None
+    for r in rows:
+        try:
+            ts = datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
+            if not solar_es_diurna(r["timestamp"], station):
+                continue
+            if darrer_ts is None or (ts - darrer_ts).total_seconds() / 60 >= interval:
+                resultat.append(dict(r))
+                darrer_ts = ts
+                if len(resultat) >= limit:
+                    break
+        except Exception:
+            continue
+
+    return jsonify(resultat)
+
+
+@app.route("/meteo/fotos/directori")
+def fotos_directori():
+    """
+    Fotos d'un dia llegides directament del directori (sense BD ni classifier).
+    ?station=torrelles&data=20260421&interval=30
+    Retorna una foto cada interval minuts.
+    """
+    from flask import request
+    import re
+    station  = request.args.get("station", "torrelles")
+    data     = request.args.get("data", datetime.now().strftime("%Y%m%d"))
+    interval = int(request.args.get("interval", 30))
+
+    dia_path = Path(f"/data/meteo/{station}/{data}")
+    if not dia_path.exists():
+        return jsonify([])
+
+    fitxers = sorted([
+        f for f in dia_path.glob("snapshot*.jpg")
+        if "latest" not in f.name
+    ])
+
+    if not fitxers:
+        return jsonify([])
+
+    resultat = []
+    darrer_ts = None
+
+    for f in fitxers:
+        nom = f.stem
+        ts = None
+        m = re.search(r"(\d{8})_(\d{6})", nom)
+        if m:
+            try:
+                ts = datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S")
+            except Exception:
+                pass
+        m2 = re.search(r"snapshot(\d{6})$", nom)
+        if not ts and m2:
+            try:
+                ts = datetime.strptime(f"{data}_{m2.group(1)}", "%Y%m%d_%H%M%S")
+            except Exception:
+                pass
+        if not ts:
+            continue
+
+        hora = ts.hour
+        if hora < 7 or hora > 21:
+            continue
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+        if not solar_es_diurna(ts_str, station):
+            continue
+        if darrer_ts is None or (ts - darrer_ts).total_seconds() / 60 >= interval:
+            resultat.append({
+                "fitxer":    str(f),
+                "timestamp": ts_str,
+                "nom":       f.name,
+            })
+            darrer_ts = ts
+
+    return jsonify(resultat)
+
+
+@app.route("/meteo/sensors/avui")
+def sensors_avui():
+    """Min/max/mitja del dia actual per estació, amb timestamps. ?station=torrelles|espui"""
+    from flask import request
+    station = request.args.get("station", "torrelles")
+    avui_str = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT
+            MIN(temp_outdoor)   AS temp_min,
+            MAX(temp_outdoor)   AS temp_max,
+            AVG(temp_outdoor)   AS temp_avg,
+            MIN(humidity)       AS hum_min,
+            MAX(humidity)       AS hum_max,
+            AVG(humidity)       AS hum_avg,
+            MIN(pressure_rel)   AS pres_min,
+            MAX(pressure_rel)   AS pres_max,
+            AVG(pressure_rel)   AS pres_avg,
+            MAX(wind_gust)      AS gust_max,
+            MAX(lightning_count) AS lightning_count_max,
+            SUM(CASE WHEN lightning_count > 0 THEN 1 ELSE 0 END) AS lightning_events,
+            SUM(COALESCE(rain_rate, 0)) AS rain_sum,
+            COUNT(*)            AS n_lectures
+        FROM meteo_readings
+        WHERE station = ? AND timestamp LIKE ?
+    """, (station, f"{avui_str}%")).fetchone()
+
+    def ts_de(camp, valor):
+        if valor is None:
+            return None
+        r = conn.execute(f"""
+            SELECT timestamp FROM meteo_readings
+            WHERE station = ? AND timestamp LIKE ? AND {camp} = ?
+            ORDER BY timestamp ASC LIMIT 1
+        """, (station, f"{avui_str}%", valor)).fetchone()
+        return r["timestamp"] if r else None
+
+    ts = {
+        "temp_min_ts":  ts_de("temp_outdoor", row["temp_min"]),
+        "temp_max_ts":  ts_de("temp_outdoor", row["temp_max"]),
+        "hum_min_ts":   ts_de("humidity",     row["hum_min"]),
+        "hum_max_ts":   ts_de("humidity",     row["hum_max"]),
+        "pres_min_ts":  ts_de("pressure_rel", row["pres_min"]),
+        "pres_max_ts":  ts_de("pressure_rel", row["pres_max"]),
+        "gust_max_ts":  ts_de("wind_gust",    row["gust_max"]),
+    }
+
+    conn.close()
+
+    if not row or not row["n_lectures"]:
+        return jsonify({"error": "sense dades"}), 404
+
+    def r(v, d=1):
+        return round(v, d) if v is not None else None
+
+    return jsonify({
+        "data":             avui_str,
+        "station":          station,
+        "n_lectures":       row["n_lectures"],
+        "temp_min":         r(row["temp_min"]),
+        "temp_max":         r(row["temp_max"]),
+        "temp_avg":         r(row["temp_avg"]),
+        "hum_min":          r(row["hum_min"], 0),
+        "hum_max":          r(row["hum_max"], 0),
+        "hum_avg":          r(row["hum_avg"], 0),
+        "pres_min":         r(row["pres_min"], 0),
+        "pres_max":         r(row["pres_max"], 0),
+        "pres_avg":         r(row["pres_avg"], 0),
+        "gust_max":         r(row["gust_max"]),
+        "rain_sum":         r(row["rain_sum"], 1),
+        "lightning_events": row["lightning_events"] or 0,
+        "lightning_max":    row["lightning_count_max"] or 0,
+        **ts,
+    })
 
 
 if __name__ == "__main__":

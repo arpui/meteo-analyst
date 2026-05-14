@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<!-- Versió: 2026-04-24 15:30 -->
+<html lang="ca">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard Meteo</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;overflow-x:hidden;max-width:100vw}
+.header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#161b22;border-bottom:0.5px solid #2a2a3a;flex-wrap:wrap;gap:6px}
+.header-left{display:flex;align-items:center;gap:10px}
+.logo{font-size:15px;font-weight:500;color:#e0e0e0}
+.status{display:flex;align-items:center;gap:5px;font-size:12px;color:#666}
+.dot{width:7px;height:7px;border-radius:50%;background:#555;transition:background 0.3s}
+.dot.ok{background:#27ae60}.dot.err{background:#e74c3c}
+.ts-label{font-size:11px;color:#555}
+.tabs{display:flex;gap:6px}
+.tab{padding:5px 14px;border-radius:6px;font-size:12px;cursor:pointer;border:0.5px solid #3a3a4a;background:transparent;color:#888;transition:all 0.15s}
+.tab:hover{color:#e0e0e0;border-color:#555}
+.tab.active{background:#185FA5;color:#fff;border-color:#185FA5}
+.tab.espui.active{background:#0F6E56;border-color:#0F6E56}
+.tab.tot.active{background:#854F0B;border-color:#854F0B}
+.refresh-btn{width:28px;height:28px;padding:0;border-radius:50%;font-size:14px;cursor:pointer;border:0.5px solid #3a3a4a;background:transparent;color:#888;line-height:1;display:flex;align-items:center;justify-content:center}
+.refresh-btn:hover{color:#e0e0e0}
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;padding:12px 12px}
+.card{background:#161b22;border-radius:8px;border:0.5px solid #2a2a3a;padding:12px 14px;min-height:110px}
+.card-title{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
+.val-row{display:flex;align-items:baseline;gap:4px}
+.val-big{font-size:30px;font-weight:400;color:#e8e8e8;line-height:1}
+.val-unit{font-size:13px;color:#666}
+.val-sub{font-size:11px;color:#555;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+.val-sub b{color:#d4a574;font-weight:400}
+.minmax{display:flex;gap:10px;margin-top:5px;font-size:11px}
+.mn{color:#5ba4ef}.mx{color:#e87070}
+.mn::before{content:"↓ ";opacity:0.7}
+.mx::before{content:"↑ ";opacity:0.7}
+.mn small, .mx small{color:#555;font-size:0.85em;margin-left:2px;opacity:0.8}
+.wind-body{display:flex;align-items:center;gap:12px;margin-top:4px}
+.compass{width:48px;height:48px;border-radius:50%;border:1px solid #2a2a3a;display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0}
+.compass-deg{font-size:13px;font-weight:500;color:#e0e0e0}
+.compass-dir{font-size:10px;color:#666}
+.rain-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+.rain-item .label{font-size:10px;color:#555}
+.rain-item .val{font-size:18px;font-weight:400;color:#5ba4ef}
+.fotos-section{padding:0 12px 12px}
+.section-title{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
+.fotos-strip{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}
+.fotos-strip::-webkit-scrollbar{height:3px}
+.fotos-strip::-webkit-scrollbar-track{background:#161b22}
+.fotos-strip::-webkit-scrollbar-thumb{background:#2a2a3a;border-radius:2px}
+.foto-item{flex-shrink:0;cursor:pointer}
+.foto-item img{width:90px;height:68px;object-fit:cover;border-radius:4px;border:0.5px solid #2a2a3a;display:block;transition:border-color 0.15s}
+.foto-item:hover img{border-color:#555}
+.foto-item.active img{border-color:#5ba4ef}
+.foto-ts{font-size:9px;color:#555;margin-top:2px;text-align:center}
+.foto-ampliada{padding:0 12px 12px;display:none}
+.foto-ampliada img{width:100%;max-height:400px;object-fit:contain;border-radius:8px;border:0.5px solid #2a2a3a}
+.foto-info{font-size:11px;color:#555;margin-top:4px}
+.charts-section{padding:0 12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
+.chart-card{background:#161b22;border-radius:8px;border:0.5px solid #2a2a3a;padding:12px}
+.chart-title{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
+.chart-legend{display:flex;gap:12px;margin-bottom:6px;flex-wrap:wrap}
+.legend-item{display:flex;align-items:center;gap:4px;font-size:11px;color:#666}
+.legend-dot{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+.loading{padding:40px;text-align:center;color:#555;font-size:13px}
+.error{padding:20px;text-align:center;color:#e74c3c;font-size:12px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="logo">Datmet</span>
+    <div class="status">
+      <div class="dot" id="dot"></div>
+      <span id="station-label">Torrelles</span>
+    </div>
+    <span class="ts-label" id="last-ts"></span>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px">
+    <div class="tabs">
+      <button class="tab active"  onclick="switchTab('torrelles',this)">Torrelles</button>
+      <button class="tab espui"   onclick="switchTab('espui',this)">Espui</button>
+      <button class="tab tot"     onclick="switchTab('tot',this)">Tot</button>
+    </div>
+    <button class="refresh-btn" onclick="refresh()" title="Actualitzar" aria-label="Actualitzar">↻</button>
+  </div>
+</div>
+
+<div id="view-estacio">
+  <div class="cards-grid" id="cards-grid"><div class="loading">Carregant...</div></div>
+  <div class="fotos-section" id="fotos-section" style="display:none">
+    <div class="section-title">Fotos del dia — cada 30 min</div>
+    <div class="fotos-strip" id="fotos-strip"></div>
+  </div>
+  <div class="foto-ampliada" id="foto-ampliada">
+    <img id="foto-gran" src="" alt="">
+    <div class="foto-info" id="foto-info"></div>
+  </div>
+  <div class="charts-section" id="charts-section"></div>
+</div>
+
+<div id="view-tot" style="display:none">
+  <div class="charts-section" id="tot-section"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+// Detecta automàticament el prefix de path
+// Local: http://192.168.31.225:8765/dashboard → API = ''
+// Remot: https://xxx.duckdns.org/temps/dashboard → API = '/temps'
+// Detecta mode estàtic via ?estacio=torrelles|espui
+const ESTACIO_FIXA = (function() {
+  const p = new URLSearchParams(window.location.search);
+  const e = p.get('estacio');
+  return ['torrelles','espui'].includes(e) ? e : null;
+})();
+
+const API = (function() {
+  const path = window.location.pathname;
+  const idx = path.lastIndexOf('/dashboard');
+  return idx > 0 ? path.substring(0, idx) : '';
+})();
+let station = 'torrelles';
+let currentTab = 'torrelles';
+let chartTemp = null, chartPres = null, chartWind = null, chartPluja = null, chartLightning = null;
+let chartCh1All = null;
+let chartCT = null, chartCH = null, chartCP = null;
+
+function fmt(v, dec=1) {
+  if (v == null || v === '') return '—';
+  const n = Number(v);
+  return isNaN(n) ? '—' : n.toFixed(dec);
+}
+
+function tsHora(ts) {
+  if (!ts) return '';
+  return ts.slice(11, 16);
+}
+
+function windDir(deg) {
+  if (deg == null) return '—';
+  const dirs = ['N','NE','E','SE','S','SO','O','NO'];
+  return dirs[Math.round(Number(deg) / 45) % 8];
+}
+
+// ── Ticks eix X: ~8 etiquetes distribuïdes uniformement ──────────────────────
+const ticksOpts = {
+  color: '#555', font: { size: 10 },
+  autoSkip: true,
+  maxTicksLimit: 8,
+  maxRotation: 0
+};
+
+const gridColor = '#2a2a3a';
+
+const baseOpts = {
+  responsive: true, maintainAspectRatio: false,
+  plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
+  scales: {
+    x: { ticks: ticksOpts, grid: { color: gridColor } },
+    y: { ticks: { color: '#555', font: { size: 10 } }, grid: { color: gridColor } }
+  },
+  elements: { point: { radius: 0 }, line: { tension: 0.3, borderWidth: 1.5 } }
+};
+
+// ── Helpers dades ─────────────────────────────────────────────────────────────
+function prepHist(hist) {
+  const sorted = [...hist].sort((a,b) => a.timestamp < b.timestamp ? -1 : 1);
+  const seen = new Set();
+  return sorted.filter(r => {
+    if (seen.has(r.timestamp)) return false;
+    seen.add(r.timestamp);
+    return true;
+  });
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(tab, el) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  const noms = {torrelles:'Torrelles', espui:'Espui', tot:'Torrelles + Espui'};
+  document.getElementById('station-label').textContent = noms[tab];
+  document.getElementById('view-estacio').style.display = tab === 'tot' ? 'none' : 'block';
+  document.getElementById('view-tot').style.display = tab === 'tot' ? 'block' : 'none';
+  // Amaga foto ampliada en canviar de tab
+  document.getElementById('foto-ampliada').style.display = 'none';
+  document.querySelectorAll('.foto-item').forEach(el => el.classList.remove('active'));
+  if (tab === 'tot') loadTot();
+  else { station = tab; loadEstacio(); }
+}
+
+function refresh() {
+  if (currentTab === 'tot') loadTot();
+  else loadEstacio();
+}
+
+// ── Cards ─────────────────────────────────────────────────────────────────────
+function renderCards(s, a) {
+  a = a || {};
+  if (!s) { document.getElementById('cards-grid').innerHTML = '<div class="error">Sense dades</div>'; return; }
+  document.getElementById('cards-grid').innerHTML = `
+    <div class="card">
+      <div class="card-title">Temperatura</div>
+      <div class="val-row">
+        <span class="val-big">${fmt(s.temp_outdoor)}</span><span class="val-unit">°C</span>
+        ${s.temp_ch1 != null ? `<span style="font-size:15px;color:#bbb;margin-left:8px">${fmt(s.temp_ch1)}°</span>` : ''}
+      </div>
+      <div class="val-sub minmax">
+        <span class="mn">${fmt(a.temp_min)}°<small>${tsHora(a.temp_min_ts)}</small></span>
+        <span class="mx">${fmt(a.temp_max)}°<small>${tsHora(a.temp_max_ts)}</small></span>
+      </div>
+      <div class="val-sub">
+        <span>Sens. <b>${fmt(s.temp_feel)}°</b></span>
+        <span>Rosada <b>${fmt(s.temp_dewpoint)}°</b></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Humitat</div>
+      <div class="val-row">
+        <span class="val-big">${fmt(s.humidity,0)}</span><span class="val-unit">%</span>
+        ${s.hum_ch1 != null ? `<span style="font-size:15px;color:#bbb;margin-left:8px">${fmt(s.hum_ch1,0)}%</span>` : ''}
+      </div>
+      <div class="val-sub minmax">
+        <span class="mn">${fmt(a.hum_min,0)}%<small>${tsHora(a.hum_min_ts)}</small></span>
+        <span class="mx">${fmt(a.hum_max,0)}%<small>${tsHora(a.hum_max_ts)}</small></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Pressió</div>
+      <div class="val-row"><span class="val-big">${fmt(s.pressure_rel,0)}</span><span class="val-unit">hPa rel</span></div>
+      <div class="val-sub minmax">
+        <span class="mn">${fmt(a.pres_min,0)}<small>${tsHora(a.pres_min_ts)}</small></span>
+        <span class="mx">${fmt(a.pres_max,0)}<small>${tsHora(a.pres_max_ts)}</small></span>
+      </div>
+      <div class="val-sub">
+        <span>Abs <b>${fmt(s.pressure_abs,0)} hPa</b></span>
+        <span>VPD <b>${fmt(s.vpd,2)} kPa</b></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Vent</div>
+      <div class="wind-body">
+        <div class="compass">
+          <span class="compass-deg">${fmt(s.wind_direction,0)}°</span>
+          <span class="compass-dir">${windDir(s.wind_direction)}</span>
+        </div>
+        <div>
+          <div class="val-row"><span class="val-big" style="font-size:26px">${fmt(s.wind_speed)}</span><span class="val-unit">km/h</span></div>
+          <div class="val-sub"><span>Ratxa <b>${fmt(s.wind_gust)} km/h</b></span></div>
+        </div>
+      </div>
+      <div class="val-sub minmax" style="margin-top:6px">
+        <span class="mx">${fmt(a.gust_max)} km/h<small>${tsHora(a.gust_max_ts)}</small></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Solar / UV</div>
+      <div class="val-row"><span class="val-big">${fmt(s.solar_radiation,0)}</span><span class="val-unit">W/m²</span></div>
+      <div class="val-sub">
+        <span>UV <b>${fmt(s.uv_index,1)}</b></span>
+        <span>Lux <b>${fmt(s.solar_lux,0)}</b></span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Pluja</div>
+      <div class="val-row"><span class="val-big">${fmt(s.rain_rate)}</span><span class="val-unit">mm/h</span></div>
+      <div class="val-sub minmax">
+        <span>Diària <b>${fmt(s.rain_daily)}</b></span>
+        <span>Horària <b>${fmt(s.rain_hourly)}</b></span>
+      </div>
+      ${s.lightning_count != null || s.lightning_distance != null ? `
+      <div class="val-sub" style="margin-top:4px">
+        <span>Rajos <b>${fmt(s.lightning_count,0)}</b></span>
+        <span>a <b>${fmt(s.lightning_distance)} km</b></span>
+      </div>` : ''}
+    </div>
+    ${s.temp_ch1 != null || s.hum_ch1 != null ? `
+    <div class="card">
+      <div class="card-title">Sensor CH1</div>
+      <div class="val-row"><span class="val-big">${fmt(s.temp_ch1)}</span><span class="val-unit">°C</span></div>
+      <div class="val-sub">
+        <span>Humitat <b>${fmt(s.hum_ch1,0)}%</b></span>
+      </div>
+    </div>` : ''}`;
+}
+
+// ── Fotos ─────────────────────────────────────────────────────────────────────
+function renderFotos(fotos) {
+  const sec = document.getElementById('fotos-section');
+  if (!fotos || !fotos.length) { sec.style.display = 'none'; return; }
+  sec.style.display = 'block';
+  document.getElementById('fotos-strip').innerHTML = fotos.map((f,i) => `
+    <div class="foto-item" onclick="showFoto(${i})">
+      <img src="${API}/meteo/foto/abs${f.fitxer}" alt="${f.timestamp}" onerror="this.parentElement.style.display='none'">
+      <div class="foto-ts">${f.timestamp.slice(11,16)}</div>
+    </div>`).join('');
+  window._fotos = fotos;
+}
+
+let _fotoIdx = -1;
+
+function showFoto(i) {
+  if (!window._fotos || i < 0 || i >= window._fotos.length) return;
+  _fotoIdx = i;
+  const f = window._fotos[i];
+  document.querySelectorAll('.foto-item').forEach((el,j) => el.classList.toggle('active', j===i));
+  document.getElementById('foto-gran').src = `${API}/meteo/foto/abs${f.fitxer}`;
+  document.getElementById('foto-info').textContent = f.timestamp;
+  document.getElementById('foto-ampliada').style.display = 'block';
+  // Desplaça scroll per mantenir thumbnail actiu visible
+  const thumb = document.querySelectorAll('.foto-item')[i];
+  if (thumb) thumb.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
+}
+
+function navFoto(delta) {
+  if (_fotoIdx < 0) return;
+  const nou = Math.max(0, Math.min(window._fotos.length - 1, _fotoIdx + delta));
+  if (nou !== _fotoIdx) showFoto(nou);
+}
+
+// Gestures tàctils + teclat
+(function setupSwipe() {
+  const amp = document.getElementById('foto-ampliada');
+  let startX = 0, startY = 0;
+  amp.addEventListener('touchstart', e => {
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+  }, {passive:true});
+  amp.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - startX;
+    const dy = e.changedTouches[0].clientY - startY;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
+      navFoto(dx < 0 ? 1 : -1);  // esquerra = següent, dreta = anterior
+    }
+  }, {passive:true});
+  // Clic a l'esquerra/dreta de la imatge (desktop)
+  amp.addEventListener('click', e => {
+    const rect = amp.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    navFoto(x < rect.width / 2 ? -1 : 1);
+  });
+  // Fletxes del teclat
+  document.addEventListener('keydown', e => {
+    if (amp.style.display === 'none') return;
+    if (e.key === 'ArrowLeft')  navFoto(-1);
+    if (e.key === 'ArrowRight') navFoto(1);
+    if (e.key === 'Escape')     amp.style.display = 'none';
+  });
+})();
+
+// ── Gràfics estació ───────────────────────────────────────────────────────────
+function renderCharts(hist) {
+  const sec = document.getElementById('charts-section');
+  if (!hist || !hist.length) { sec.innerHTML = ''; return; }
+  const rows   = prepHist(hist);
+  const labels = rows.map(r => r.timestamp.slice(11,16));
+  const temps  = rows.map(r => r.temp_outdoor);
+  const hums   = rows.map(r => r.humidity);
+  const prels  = rows.map(r => r.pressure_rel);
+  const plujes = rows.map(r => r.rain_rate);
+  const vents  = rows.map(r => r.wind_speed);
+  const ratxes = rows.map(r => r.wind_gust);
+  const tempsCh1 = rows.map(r => r.temp_ch1);
+  const humsCh1  = rows.map(r => r.hum_ch1);
+  const hasRain      = rows.some(r => (r.rain_rate ?? 0) > 0);
+  const hasLightning = rows.some(r => (r.lightning_count ?? 0) > 0);
+  const hasCh1       = rows.some(r => r.temp_ch1 != null || r.hum_ch1 != null);
+
+  sec.innerHTML = `
+    <div class="chart-card">
+      <div class="chart-title">Temperatura i humitat — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#e87070"></div>Temperatura (°C)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#5ba4ef"></div>Humitat (%)</div>
+      </div>
+      <div style="position:relative;height:180px"><canvas id="chartTH" role="img" aria-label="Temperatura i humitat 24h">Temperatura i humitat.</canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Pressió — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>Pressió (hPa)</div>
+      </div>
+      <div style="position:relative;height:180px"><canvas id="chartP" role="img" aria-label="Pressió 24h">Pressió.</canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Vent — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#5dcaa5"></div>Vent (km/h)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#d4a574"></div>Ratxa (km/h)</div>
+      </div>
+      <div style="position:relative;height:180px"><canvas id="chartW" role="img" aria-label="Vent 24h">Vent.</canvas></div>
+    </div>
+    ${hasRain ? `
+    <div class="chart-card">
+      <div class="chart-title">Pluja — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#5ba4ef"></div>Rate mm/h</div>
+      </div>
+      <div style="position:relative;height:180px"><canvas id="chartR" role="img" aria-label="Pluja 24h">Pluja.</canvas></div>
+    </div>` : ''}
+    ${hasCh1 ? `
+    <div class="chart-card">
+      <div class="chart-title">Comparativa sensors — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#e87070"></div>Temp ext (°C)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef9f27"></div>Temp CH1 (°C)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#5ba4ef"></div>Hum ext (%)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#5dcaa5"></div>Hum CH1 (%)</div>
+      </div>
+      <div style="position:relative;height:200px"><canvas id="chartCh1All" role="img" aria-label="Comparativa sensors 24h">Comparativa sensors.</canvas></div>
+    </div>` : ''}
+    ${hasLightning ? `
+    <div class="chart-card">
+      <div class="chart-title">Llamps — 24h</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#f0c040"></div>Distància (km)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#e87070"></div>Comptador</div>
+      </div>
+      <div style="position:relative;height:180px"><canvas id="chartL" role="img" aria-label="Llamps 24h">Llamps.</canvas></div>
+    </div>` : ''}`;
+
+  if (chartTemp) chartTemp.destroy();
+  chartTemp = new Chart(document.getElementById('chartTH'), {
+    type: 'line', data: { labels, datasets: [
+      { label:'Temp °C', data:temps, borderColor:'#e87070', yAxisID:'y' },
+      { label:'Hum %',   data:hums,  borderColor:'#5ba4ef', yAxisID:'y2', borderDash:[4,2] }
+    ]},
+    options: { ...baseOpts, scales: {
+      x: baseOpts.scales.x,
+      y:  { ...baseOpts.scales.y, position:'left' },
+      y2: { ticks:{color:'#555',font:{size:10}}, grid:{drawOnChartArea:false}, position:'right' }
+    }}
+  });
+  if (chartPres) chartPres.destroy();
+  chartPres = new Chart(document.getElementById('chartP'), {
+    type:'line',
+    data: { labels, datasets: [{ label:'hPa', data:prels, borderColor:'#a78bfa', borderWidth:1.5 }]},
+    options: baseOpts
+  });
+
+  // Gràfic vent + ratxes
+  if (chartWind) { chartWind.destroy(); chartWind = null; }
+  chartWind = new Chart(document.getElementById('chartW'), {
+    type:'line',
+    data: { labels, datasets: [
+      { label:'Vent km/h',  data:vents,  borderColor:'#5dcaa5', borderWidth:1.5 },
+      { label:'Ratxa km/h', data:ratxes, borderColor:'#d4a574', borderWidth:1.2, borderDash:[4,2] }
+    ]},
+    options: baseOpts
+  });
+
+  // Gràfic pluja (condicional)
+  if (chartPluja) { chartPluja.destroy(); chartPluja = null; }
+  if (hasRain) {
+    chartPluja = new Chart(document.getElementById('chartR'), {
+      type:'bar',
+      data: { labels, datasets: [{ label:'mm/h', data:plujes,
+        backgroundColor:'rgba(91,164,239,0.4)', borderColor:'#5ba4ef', borderWidth:1 }]},
+      options: baseOpts
+    });
+  }
+
+  // Gràfics CH1 (condicional)
+  if (chartCh1All) { chartCh1All.destroy(); chartCh1All = null; }
+  if (hasCh1) {
+    chartCh1All = new Chart(document.getElementById('chartCh1All'), {
+      type:'line', data:{labels, datasets:[
+        {label:'T ext',  data:temps,    borderColor:'#e87070', borderWidth:1.5, yAxisID:'y',  spanGaps:true},
+        {label:'T CH1',  data:tempsCh1, borderColor:'#ef9f27', borderWidth:1.5, yAxisID:'y',  borderDash:[5,3], spanGaps:true},
+        {label:'H ext',  data:hums,     borderColor:'#5ba4ef', borderWidth:1.2, yAxisID:'y2', spanGaps:true},
+        {label:'H CH1',  data:humsCh1,  borderColor:'#5dcaa5', borderWidth:1.2, yAxisID:'y2', borderDash:[5,3], spanGaps:true}
+      ]},
+      options: { ...baseOpts, scales: {
+        x: baseOpts.scales.x,
+        y:  { ...baseOpts.scales.y, position:'left' },
+        y2: { ticks:{color:'#555',font:{size:10}}, grid:{drawOnChartArea:false}, position:'right' }
+      }}
+    });
+  }
+
+  // Gràfic llamps (condicional)
+  if (chartLightning) { chartLightning.destroy(); chartLightning = null; }
+  if (hasLightning) {
+    const dists  = rows.map(r => r.lightning_distance);
+    const counts = rows.map(r => r.lightning_count);
+    chartLightning = new Chart(document.getElementById('chartL'), {
+      data: { labels, datasets: [
+        { type:'line', label:'Distància km', data:dists, borderColor:'#f0c040', borderWidth:1.5, yAxisID:'y',  spanGaps:true, order:2 },
+        { type:'bar',  label:'Comptador',    data:counts, backgroundColor:'rgba(232,112,112,0.4)', borderColor:'#e87070', borderWidth:1, yAxisID:'y2', order:1 }
+      ]},
+      options: { ...baseOpts, scales: {
+        x: baseOpts.scales.x,
+        y:  { ...baseOpts.scales.y, position:'left' },
+        y2: { ticks:{color:'#555',font:{size:10}}, grid:{drawOnChartArea:false}, position:'right', beginAtZero:true }
+      }}
+    });
+  }
+}
+
+// ── Càrrega estació ───────────────────────────────────────────────────────────
+async function loadEstacio() {
+  document.getElementById('dot').className = 'dot';
+  const avui = new Date().toISOString().slice(0,10).replace(/-/g,'');
+  try {
+    const [sensRes, avuiRes, histRes, fotosRes] = await Promise.allSettled([
+      fetch(`${API}/meteo/sensors/latest?station=${station}`),
+      fetch(`${API}/meteo/sensors/avui?station=${station}`),
+      fetch(`${API}/meteo/sensors/historial24h?station=${station}`),
+      fetch(`${API}/meteo/fotos/directori?data=${avui}&station=${station}&interval=30`)
+    ]);
+    const sens  = sensRes.status==='fulfilled'  && sensRes.value.ok  ? await sensRes.value.json() : null;
+    const avui2 = avuiRes.status==='fulfilled'  && avuiRes.value.ok  ? await avuiRes.value.json() : null;
+    const hist  = histRes.status==='fulfilled'  && histRes.value.ok  ? await histRes.value.json() : [];
+    const fotos = fotosRes.status==='fulfilled' && fotosRes.value.ok ? await fotosRes.value.json() : [];
+    renderCards(sens, avui2);
+    renderFotos(fotos);
+    renderCharts(hist);
+    if (sens) {
+      document.getElementById('dot').className = 'dot ok';
+      document.getElementById('last-ts').textContent = (sens.timestamp||'').slice(11,16);
+    }
+  } catch(e) {
+    document.getElementById('dot').className = 'dot err';
+    document.getElementById('cards-grid').innerHTML = `<div class="error">Error: ${e.message}</div>`;
+  }
+}
+
+// ── Càrrega Tot ───────────────────────────────────────────────────────────────
+async function loadTot() {
+  document.getElementById('dot').className = 'dot';
+  const sec = document.getElementById('tot-section');
+  sec.innerHTML = '<div class="loading">Carregant dades comparatives...</div>';
+  try {
+    const [torRes, espRes] = await Promise.allSettled([
+      fetch(`${API}/meteo/sensors/historial24h?station=torrelles`),
+      fetch(`${API}/meteo/sensors/historial24h?station=espui`)
+    ]);
+    const tor = torRes.status==='fulfilled' && torRes.value.ok ? await torRes.value.json() : [];
+    const esp = espRes.status==='fulfilled' && espRes.value.ok ? await espRes.value.json() : [];
+
+    if (!tor.length && !esp.length) { sec.innerHTML = '<div class="error">Sense dades</div>'; return; }
+
+    document.getElementById('dot').className = 'dot ok';
+
+    sec.innerHTML = `
+      <div class="chart-card">
+        <div class="chart-title">Temperatura — 24h</div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#e87070"></div>Torrelles (°C)</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#ef9f27"></div>Espui (°C) ---</div>
+        </div>
+        <div style="position:relative;height:200px"><canvas id="cCT" role="img" aria-label="Temperatura comparativa 24h">Temperatura.</canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Humitat — 24h</div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#5ba4ef"></div>Torrelles (%)</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#5dcaa5"></div>Espui (%) ---</div>
+        </div>
+        <div style="position:relative;height:180px"><canvas id="cCH" role="img" aria-label="Humitat comparativa 24h">Humitat.</canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Pressió relativa — 24h</div>
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>Torrelles (hPa)</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#f09595"></div>Espui (hPa) ---</div>
+        </div>
+        <div style="position:relative;height:180px"><canvas id="cCP" role="img" aria-label="Pressió comparativa 24h">Pressió.</canvas></div>
+      </div>`;
+
+    const torRows = prepHist(tor);
+    const espRows = prepHist(esp);
+    const torMap = {};  torRows.forEach(r => { torMap[r.timestamp] = r; });
+    const espMap = {};  espRows.forEach(r => { espMap[r.timestamp] = r; });
+    const allTs = [...new Set([...torRows.map(r=>r.timestamp), ...espRows.map(r=>r.timestamp)])].sort();
+    const labels = allTs.map(ts => ts.slice(11,16));
+
+    const mk = (map, field) => allTs.map(ts => map[ts] ? map[ts][field] : null);
+
+    if (chartCT) chartCT.destroy();
+    chartCT = new Chart(document.getElementById('cCT'), {
+      type:'line', data:{labels, datasets:[
+        {label:'Torrelles °C', data:mk(torMap,'temp_outdoor'), borderColor:'#e87070', borderWidth:2, spanGaps:true},
+        {label:'Espui °C',     data:mk(espMap,'temp_outdoor'), borderColor:'#ef9f27', borderWidth:1.5, borderDash:[5,3], spanGaps:true}
+      ]}, options: baseOpts
+    });
+    if (chartCH) chartCH.destroy();
+    chartCH = new Chart(document.getElementById('cCH'), {
+      type:'line', data:{labels, datasets:[
+        {label:'Torrelles %', data:mk(torMap,'humidity'), borderColor:'#5ba4ef', borderWidth:2, spanGaps:true},
+        {label:'Espui %',     data:mk(espMap,'humidity'), borderColor:'#5dcaa5', borderWidth:1.5, borderDash:[5,3], spanGaps:true}
+      ]}, options: baseOpts
+    });
+    if (chartCP) chartCP.destroy();
+    chartCP = new Chart(document.getElementById('cCP'), {
+      type:'line', data:{labels, datasets:[
+        {label:'Torrelles hPa', data:mk(torMap,'pressure_rel'), borderColor:'#a78bfa', borderWidth:2, spanGaps:true},
+        {label:'Espui hPa',     data:mk(espMap,'pressure_rel'), borderColor:'#f09595', borderWidth:1.5, borderDash:[5,3], spanGaps:true}
+      ]}, options: baseOpts
+    });
+
+  } catch(e) {
+    sec.innerHTML = `<div class="error">Error: ${e.message}</div>`;
+    document.getElementById('dot').className = 'dot err';
+  }
+}
+
+// Aplica mode estàtic si cal
+if (ESTACIO_FIXA) {
+  station = ESTACIO_FIXA;
+  currentTab = ESTACIO_FIXA;
+  // Amaga tots els tabs
+  document.querySelectorAll('.tabs').forEach(el => el.style.display = 'none');
+  // Actualitza label
+  const noms = {torrelles:'Torrelles', espui:'Espui'};
+  document.getElementById('station-label').textContent = noms[ESTACIO_FIXA];
+  // Assegura que es mostri la vista d'estació
+  document.getElementById('view-estacio').style.display = 'block';
+  document.getElementById('view-tot').style.display = 'none';
+}
+
+loadEstacio();
+setInterval(() => {
+  if (currentTab === 'tot') loadTot();
+  else loadEstacio();
+}, 60000);
+</script>
+</body>
+</html>
