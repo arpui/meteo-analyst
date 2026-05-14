@@ -127,6 +127,7 @@ let currentTab = 'torrelles';
 let chartTemp = null, chartPres = null, chartWind = null, chartPluja = null, chartLightning = null;
 let chartCh1All = null;
 let chartCT = null, chartCH = null, chartCP = null;
+let vist_en_altre_card = true;
 
 function fmt(v, dec=1) {
   if (v == null || v === '') return '—';
@@ -277,7 +278,7 @@ function renderCards(s, a) {
         <span>a <b>${fmt(s.lightning_distance)} km</b></span>
       </div>` : ''}
     </div>
-    ${s.temp_ch1 != null || s.hum_ch1 != null ? `
+    ${!vist_en_altre_card && (s.temp_ch1 != null || s.hum_ch1 != null) ? `
     <div class="card">
       <div class="card-title">Sensor CH1</div>
       <div class="val-row"><span class="val-big">${fmt(s.temp_ch1)}</span><span class="val-unit">°C</span></div>
